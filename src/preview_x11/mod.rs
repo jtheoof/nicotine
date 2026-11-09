@@ -91,10 +91,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const PREVIEW_WIDTH: u16 = 480;
 const PREVIEW_HEIGHT: u16 = 270;
 
-const TITLE_STRIP_HEIGHT: u16 = 24;
-const BORDER_WIDTH: u16 = 3;
-const TITLE_FONT_PX: f32 = 14.0;
-const TITLE_TEXT_LEFT_PAD: i16 = 10;
+pub(crate) const TITLE_STRIP_HEIGHT: u16 = 24;
+pub(crate) const BORDER_WIDTH: u16 = 3;
+pub(crate) const TITLE_FONT_PX: f32 = 14.0;
+pub(crate) const TITLE_TEXT_LEFT_PAD: i16 = 10;
 
 // Drag / snap thresholds (DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX) live
 // in `preview_common` since both the X11 and Windows managers use
@@ -103,9 +103,9 @@ const TITLE_TEXT_LEFT_PAD: i16 = 10;
 // Brand palette. Same RGB triples as the Windows preview chrome and the
 // (now-removed) Linux egui overlay so the look stays consistent across
 // platforms.
-const NICOTINE_RED: (u8, u8, u8) = (196, 30, 58);
-const CHROME_DARK: (u8, u8, u8) = (30, 30, 30);
-const NICOTINE_CREAM: (u8, u8, u8) = (252, 250, 242);
+pub(crate) const NICOTINE_RED: (u8, u8, u8) = (196, 30, 58);
+pub(crate) const CHROME_DARK: (u8, u8, u8) = (30, 30, 30);
+pub(crate) const NICOTINE_CREAM: (u8, u8, u8) = (252, 250, 242);
 const LIST_TEXT_BLACK: (u8, u8, u8) = (30, 30, 30);
 /// Brand gold used for the list-view window's perimeter border. Same
 /// hue as the (now-removed) egui overlay's frame so the list-view
@@ -134,6 +134,9 @@ mod render;
 use list::OwnedListWindow;
 use preview::OwnedPreview;
 use render::*;
+// Shared with the Wayland-native preview backend (`preview_wayland`) so both
+// draw identical chrome.
+pub(crate) use render::{jetbrains_mono, rasterize_text, thumbnail_size};
 
 /// Total height of the list window for `n` character rows. Includes
 /// the 2-px gold border top and bottom, the red title strip, the

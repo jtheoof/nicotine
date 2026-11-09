@@ -79,6 +79,17 @@ evdev = "0.12"
 # Pure-Rust impl via wayland-backend.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# Wayland-native preview backend (Hyprland): layer-shell overlay surfaces,
+# shm pools, seat/pointer and output tracking. Same version winit already
+# pulls in, so no extra copy gets built. wlr protocols provide the
+# foreign-toplevel "activated" state used for the active-client border.
+smithay-client-toolkit = { version = "0.20", default-features = false }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# GPU buffer allocation for zero-copy preview capture (dmabuf): Hyprland
+# copies EVE's frame GPU-to-GPU into these and we display them as-is,
+# instead of a GPU->CPU readback into shm plus a re-upload. Links libgbm
+# (mesa); default features off since we only allocate, never import.
+gbm = { version = "0.18", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [

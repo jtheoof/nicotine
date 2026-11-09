@@ -41,7 +41,7 @@ pub(super) fn xcolor(rgb: (u8, u8, u8), alpha: u16) -> RenderColor {
 /// every preview's text rasterization. Bundled into preview chrome so we
 /// don't depend on system fontconfig — same font shows up regardless of
 /// the user's distro / Wayland font setup.
-pub(super) fn jetbrains_mono() -> &'static FontRef<'static> {
+pub(crate) fn jetbrains_mono() -> &'static FontRef<'static> {
     static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
     FONT.get_or_init(|| {
         FontRef::try_from_slice(include_bytes!(
@@ -66,7 +66,7 @@ pub(super) fn marlboro() -> &'static FontRef<'static> {
 /// (Width, height) of the thumbnail area within a preview window.
 /// Subtracts the title strip from the top and the border on left,
 /// right, and bottom.
-pub(super) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
+pub(crate) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
     let w = window_w.saturating_sub(BORDER_WIDTH * 2);
     let h = window_h
         .saturating_sub(TITLE_STRIP_HEIGHT)
@@ -152,7 +152,7 @@ pub(super) fn pick_argb32_format(reply: &render::QueryPictFormatsReply) -> Optio
 /// Rasterize `text` at `font_px` into a packed alpha buffer using
 /// `font`. Returns (bytes, width, height). Each byte is the coverage
 /// (0–255) for one pixel; row-major, no padding.
-pub(super) fn rasterize_text(font: &FontRef<'_>, text: &str, font_px: f32) -> (Vec<u8>, u16, u16) {
+pub(crate) fn rasterize_text(font: &FontRef<'_>, text: &str, font_px: f32) -> (Vec<u8>, u16, u16) {
     let scaled = font.as_scaled(PxScale::from(font_px));
     let ascent = scaled.ascent();
     let descent = scaled.descent();
