@@ -1,5 +1,7 @@
 use crate::config::{CharacterHotkey, Config, LiveSettings};
 use iced::{Color, Element, Subscription, Task, Theme};
+
+use crate::theme::PanelPalette;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,37 +13,18 @@ mod ui;
 /// write rather than hammering disk on every pixel / keystroke.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-// ---- Brand palette (matches the Linux preview/list windows). ----
-pub(super) const NICOTINE_RED: Color = Color {
-    r: 196.0 / 255.0,
-    g: 30.0 / 255.0,
-    b: 58.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_GOLD: Color = Color {
-    r: 180.0 / 255.0,
-    g: 155.0 / 255.0,
-    b: 105.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_CREAM: Color = Color {
-    r: 252.0 / 255.0,
-    g: 250.0 / 255.0,
-    b: 242.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_BLACK: Color = Color {
-    r: 30.0 / 255.0,
-    g: 30.0 / 255.0,
-    b: 30.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_GREEN: Color = Color {
-    r: 60.0 / 255.0,
-    g: 140.0 / 255.0,
-    b: 70.0 / 255.0,
-    a: 1.0,
-};
+// ---- Colours: the configured app theme's panel palette (`theme` in
+// config.toml), fixed for the panel's lifetime. Defaults to the Nicotine
+// brand palette if read before `run` sets it (e.g. in tests). ----
+static PALETTE: std::sync::OnceLock<PanelPalette> = std::sync::OnceLock::new();
+
+pub(super) fn palette() -> &'static PanelPalette {
+    PALETTE.get_or_init(|| crate::theme::Theme::NICOTINE.panel)
+}
+
+pub(super) fn color(rgb: crate::theme::Rgb) -> Color {
+    Color::from_rgb8(rgb.0, rgb.1, rgb.2)
+}
 
 // ---- Type scale (logical px). One deliberate set of sizes. ----
 // TEXT_SIZE is the app-wide default (set in `run`); everything interactive
@@ -728,16 +711,20 @@ fn view(panel: &Panel) -> Element<'_, Message> {
     .into()
 }
 
+/// iced palette for built-in widgets (checkboxes, sliders, inputs, pick
+/// lists, plain buttons); iced derives their hover/weak/strong shades from
+/// it, including dark-background variants.
 fn theme(_panel: &Panel) -> Theme {
+    let p = palette();
     Theme::custom(
         "Nicotine".to_string(),
         iced::theme::Palette {
-            background: NICOTINE_CREAM,
-            text: NICOTINE_BLACK,
-            primary: NICOTINE_RED,
-            success: NICOTINE_GREEN,
-            warning: NICOTINE_GOLD,
-            danger: NICOTINE_RED,
+            background: color(p.background),
+            text: color(p.text),
+            primary: color(p.accent),
+            success: color(p.success),
+            warning: color(p.subtle),
+            danger: color(p.danger),
         },
     )
 }
@@ -1170,6 +1157,7 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
         iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok();
 
     let audio = crate::audio::spawn();
+    let _ = PALETTE.set(crate::theme::Theme::named(config.theme.as_deref()).panel);
 
     // `mut` is only used on Linux (the app_id assignment below); on other
     // platforms the binding is never mutated, so allow the unused-mut lint

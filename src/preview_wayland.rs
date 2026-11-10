@@ -108,11 +108,9 @@ use crate::preview_common::{
     preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::preview_positions::PreviewPositions;
-use crate::preview_x11::{
-    thumbnail_size, BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM, NICOTINE_RED, TITLE_STRIP_HEIGHT,
-    TITLE_TEXT_LEFT_PAD,
-};
+use crate::preview_x11::{thumbnail_size, BORDER_WIDTH, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD};
 use crate::text_render::{self, Antialias, TextFont, TextMask};
+use crate::theme::{PreviewTheme, Rgb};
 use crate::window_manager::{
     detect_display_server, detect_wayland_compositor, DisplayServer, WaylandCompositor,
     WindowManager,
@@ -182,12 +180,13 @@ pub fn spawn(
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
     font: FontSettings,
+    theme: PreviewTheme,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
         .name("preview-wayland".into())
         .spawn(move || {
-            let (mut queue, mut manager) = match Manager::connect(wm, state, live, font) {
+            let (mut queue, mut manager) = match Manager::connect(wm, state, live, font, theme) {
                 Ok(v) => {
                     let _ = tx.send(Ok(()));
                     v
@@ -489,6 +488,7 @@ struct Manager {
     capture_interval: Duration,
     title_font: TextFont,
     title_font_px: f32,
+    theme: PreviewTheme,
     /// `None`: pick per output from its reported subpixel layout.
     antialias: Option<Antialias>,
     last_applied_opacity: u32,
@@ -503,6 +503,7 @@ impl Manager {
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
         font: FontSettings,
+        theme: PreviewTheme,
     ) -> Result<(EventQueue<Self>, Self)> {
         let title_font = TextFont::load_or_bundled(font.font.as_deref());
         let antialias = match font.antialias.as_deref() {
@@ -594,6 +595,7 @@ impl Manager {
             capture_interval: Duration::from_secs(1) / capture_fps,
             title_font,
             title_font_px: font.size_px,
+            theme,
             antialias,
             last_applied_opacity: 0,
             needs_reconcile: true,
@@ -948,12 +950,16 @@ impl Manager {
             eprintln!("Wayland preview: chrome buffer allocation failed");
             return;
         };
-        let chrome = if p.is_active {
-            NICOTINE_RED
-        } else {
-            CHROME_DARK
-        };
-        paint_chrome(canvas, w as usize, h as usize, chrome, &p.title_mask);
+        let (chrome, text) = self.theme.chrome(p.is_active);
+        paint_chrome(
+            canvas,
+            w as usize,
+            h as usize,
+            chrome,
+            text,
+            self.theme.background,
+            &p.title_mask,
+        );
 
         let surface = p.layer.wl_surface();
         if buffer.attach_to(surface).is_err() {
@@ -1518,10 +1524,21 @@ fn apply_opacity(p: &Preview, percent: u32) {
 /// Paint title strip + border in `chrome`, the thumbnail well in black,
 /// and blend the pre-rasterized title text in cream. `canvas` is
 /// ARGB8888 little-endian (B, G, R, A byte order).
-fn paint_chrome(canvas: &mut [u8], w: usize, h: usize, chrome: (u8, u8, u8), text: &TextMask) {
-    let px = |c: (u8, u8, u8)| [c.2, c.1, c.0, 0xff];
+/// Paint title strip + border in `chrome`, the thumbnail well in
+/// `background`, and blend the title text in `text_color`. `canvas` is
+/// ARGB8888 little-endian (B, G, R, A byte order).
+fn paint_chrome(
+    canvas: &mut [u8],
+    w: usize,
+    h: usize,
+    chrome: Rgb,
+    text_color: Rgb,
+    background: Rgb,
+    text: &TextMask,
+) {
+    let px = |c: Rgb| [c.2, c.1, c.0, 0xff];
     let chrome_px = px(chrome);
-    let well_px = px((0, 0, 0));
+    let well_px = px(background);
     let title_h = TITLE_STRIP_HEIGHT as usize;
     let border = BORDER_WIDTH as usize;
     for y in 0..h {
@@ -1551,7 +1568,7 @@ fn paint_chrome(canvas: &mut [u8], w: usize, h: usize, chrome: (u8, u8, u8), tex
         top,
         w.saturating_sub(left * 2),
         &clipped,
-        NICOTINE_CREAM,
+        text_color,
     );
 }
 
@@ -2227,6 +2244,7 @@ mod tests {
             Arc::new(Mutex::new(CycleState::new())),
             live,
             font,
+            PreviewTheme::from_config(std::env::var("NICOTINE_TEST_THEME").ok().as_deref(), None),
         )
         .expect("bind Wayland globals");
         let qh = queue.handle();
@@ -2291,22 +2309,32 @@ mod tests {
     }
 
     #[test]
-    fn chrome_fills_strip_border_and_black_well() {
+    fn chrome_fills_strip_border_and_well() {
         let (w, h) = (40usize, 40usize);
         let mut canvas = vec![0u8; w * h * 4];
-        paint_chrome(&mut canvas, w, h, NICOTINE_RED, &TextMask::default());
+        let t = crate::theme::Theme::NORD_DARK.preview;
+        paint_chrome(
+            &mut canvas,
+            w,
+            h,
+            t.active,
+            t.active_text,
+            t.background,
+            &TextMask::default(),
+        );
         let at = |x: usize, y: usize| &canvas[(y * w + x) * 4..(y * w + x) * 4 + 4];
-        let red = [NICOTINE_RED.2, NICOTINE_RED.1, NICOTINE_RED.0, 0xff];
+        let frost = [t.active.2, t.active.1, t.active.0, 0xff];
         // Title strip, left border, bottom border are chrome-colored.
-        assert_eq!(at(20, 0), red);
-        assert_eq!(at(0, 30), red);
-        assert_eq!(at(20, h - 1), red);
-        // Thumbnail well is opaque black.
-        assert_eq!(at(20, TITLE_STRIP_HEIGHT as usize + 2), [0, 0, 0, 0xff]);
+        assert_eq!(at(20, 0), frost);
+        assert_eq!(at(0, 30), frost);
+        assert_eq!(at(20, h - 1), frost);
+        // Thumbnail well is the theme background, opaque.
+        let bg = [t.background.2, t.background.1, t.background.0, 0xff];
+        assert_eq!(at(20, TITLE_STRIP_HEIGHT as usize + 2), bg);
     }
 
     #[test]
-    fn chrome_text_blends_toward_cream() {
+    fn chrome_text_uses_theme_text_colour() {
         let (w, h) = (40usize, 40usize);
         let mut canvas = vec![0u8; w * h * 4];
         let text = TextMask {
@@ -2316,12 +2344,10 @@ mod tests {
             subpixel: false,
             data: vec![255; 4],
         };
-        paint_chrome(&mut canvas, w, h, CHROME_DARK, &text);
+        let t = crate::theme::Theme::NICOTINE.preview;
+        paint_chrome(&mut canvas, w, h, t.inactive, t.text, t.background, &text);
         let top = (TITLE_STRIP_HEIGHT as usize - 2) / 2;
         let off = (top * w + TITLE_TEXT_LEFT_PAD as usize) * 4;
-        assert_eq!(
-            &canvas[off..off + 3],
-            &[NICOTINE_CREAM.2, NICOTINE_CREAM.1, NICOTINE_CREAM.0]
-        );
+        assert_eq!(&canvas[off..off + 3], &[t.text.2, t.text.1, t.text.0]);
     }
 }

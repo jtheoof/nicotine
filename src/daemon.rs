@@ -306,6 +306,10 @@ impl Daemon {
                 Arc::clone(&self.state),
                 Arc::clone(&self.live),
                 crate::preview_wayland::FontSettings::from_config(&self.config),
+                crate::theme::PreviewTheme::from_config(
+                    self.config.theme.as_deref(),
+                    self.config.preview_colors.as_ref(),
+                ),
             ) {
                 Ok(()) => return,
                 Err(e) => eprintln!(

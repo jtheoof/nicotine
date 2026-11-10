@@ -178,6 +178,39 @@ pub struct Config {
     /// "bgr".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_font_antialias: Option<String>,
+    /// App colour theme for the config panel and the (Linux, Wayland)
+    /// preview chrome: "nicotine" (default), "nord" / "nord-dark", or
+    /// "nord-light". `preview_theme` is accepted as an older name.
+    #[serde(
+        default,
+        alias = "preview_theme",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub theme: Option<String>,
+    /// Per-colour preview-chrome overrides on top of `theme`, as "#RRGGBB".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_colors: Option<PreviewColors>,
+}
+
+/// `[preview_colors]` table: optional "#RRGGBB" overrides for the preview
+/// chrome theme. Unset keys keep the theme's colour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewColors {
+    /// Title strip and border of the focused client's preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Title text on the active strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_text: Option<String>,
+    /// Title strip and border of other previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<String>,
+    /// Title text on inactive strips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Thumbnail area before the first frame arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
 }
 
 #[cfg(unix)]
@@ -418,6 +451,8 @@ impl Config {
             preview_font: None,
             preview_font_size: default_preview_font_size(),
             preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
         }
     }
 
@@ -480,6 +515,8 @@ mod tests {
             preview_font: None,
             preview_font_size: 14.0,
             preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -522,6 +559,8 @@ mod tests {
             preview_font: None,
             preview_font_size: 14.0,
             preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -563,6 +602,8 @@ mod tests {
             preview_font: None,
             preview_font_size: 14.0,
             preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,
@@ -625,5 +666,35 @@ mod tests {
             deserialized.window_height, 800,
             "window_height must survive a save/load round-trip"
         );
+    }
+
+    #[test]
+    fn theme_and_preview_colors_round_trip() {
+        let mut config = Config::build_default(2560, 1440);
+        config.theme = Some("nord-light".into());
+        config.preview_colors = Some(PreviewColors {
+            active: Some("#BF616A".into()),
+            ..Default::default()
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[preview_colors]"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.theme.as_deref(), Some("nord-light"));
+        assert_eq!(back.preview_colors, config.preview_colors);
+
+        // Unset theme settings stay out of the file entirely.
+        let plain = toml::to_string_pretty(&Config::build_default(2560, 1440)).unwrap();
+        assert!(!plain.contains("theme") && !plain.contains("preview_colors"));
+    }
+
+    #[test]
+    fn preview_theme_is_accepted_as_old_name_for_theme() {
+        let mut text = toml::to_string_pretty(&Config::build_default(2560, 1440)).unwrap();
+        text.insert_str(0, "preview_theme = \"nord\"\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.theme.as_deref(), Some("nord"));
+        // Saved back under the new name.
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("theme = \"nord\"") && !saved.contains("preview_theme"));
     }
 }

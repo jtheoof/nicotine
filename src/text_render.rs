@@ -219,6 +219,11 @@ pub fn rasterize(font: &TextFont, text: &str, em_px: f32, aa: Antialias) -> Text
     mask
 }
 
+/// Relative luminance (Rec. 709 weights on linear channels).
+fn luminance(c: (u8, u8, u8)) -> f32 {
+    0.2126 * srgb_to_linear(c.0) + 0.7152 * srgb_to_linear(c.1) + 0.0722 * srgb_to_linear(c.2)
+}
+
 fn srgb_to_linear(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -240,8 +245,14 @@ fn linear_to_srgb(c: f32) -> u8 {
 
 /// Blend `mask` in colour `fg` onto an opaque ARGB8888 little-endian
 /// canvas (B, G, R, A bytes) of `canvas_w` × `canvas_h` pixels, with the
-/// mask's top-left at (x0, y0), clipped to `max_w` columns. Blending is in
-/// linear light, per channel for subpixel masks.
+/// mask's top-left at (x0, y0), clipped to `max_w` columns, per channel for
+/// subpixel masks.
+///
+/// Light text on a darker background blends in linear light; plain sRGB
+/// blending makes it look thin and washed out. Dark text on a lighter
+/// background blends in sRGB space: linear blending has the opposite
+/// effect there (thin, faded stems). FreeType and Skia make the same
+/// luminance-dependent choice.
 #[allow(clippy::too_many_arguments)]
 pub fn blend_mask(
     canvas: &mut [u8],
@@ -258,6 +269,7 @@ pub fn blend_mask(
         srgb_to_linear(fg.1),
         srgb_to_linear(fg.0),
     ];
+    let fg_srgb = [fg.2, fg.1, fg.0];
     for my in 0..mask.height {
         let y = y0 + my;
         if y >= canvas_h {
@@ -273,11 +285,18 @@ pub fn blend_mask(
                 continue;
             }
             let off = (y * canvas_w + x) * 4;
+            let bg_px = (canvas[off + 2], canvas[off + 1], canvas[off]);
+            let linear = luminance(fg) >= luminance(bg_px);
             // Canvas byte order is B, G, R.
             for (i, cov) in [b, g, r].into_iter().enumerate() {
                 let a = cov as f32 / 255.0;
-                let bg = srgb_to_linear(canvas[off + i]);
-                canvas[off + i] = linear_to_srgb(bg + (fg_lin[i] - bg) * a);
+                canvas[off + i] = if linear {
+                    let bg = srgb_to_linear(canvas[off + i]);
+                    linear_to_srgb(bg + (fg_lin[i] - bg) * a)
+                } else {
+                    let (bg, fg) = (canvas[off + i] as f32, fg_srgb[i] as f32);
+                    (bg + (fg - bg) * a + 0.5) as u8
+                };
             }
         }
     }
@@ -503,6 +522,22 @@ mod tests {
         };
         blend_mask(&mut canvas, 1, 1, 0, 0, 1, &full, (252, 250, 242));
         assert_eq!(canvas, vec![242, 250, 252, 255]);
+    }
+
+    #[test]
+    fn dark_text_on_light_blends_in_srgb() {
+        // 50% black over white: sRGB-space midpoint (128), not the much
+        // lighter linear-light result (~188) that makes dark text faint.
+        let mut canvas = vec![255, 255, 255, 255];
+        let mask = TextMask {
+            width: 1,
+            height: 1,
+            baseline: 1,
+            subpixel: false,
+            data: vec![128],
+        };
+        blend_mask(&mut canvas, 1, 1, 0, 0, 1, &mask, (0, 0, 0));
+        assert!((126..=129).contains(&canvas[0]), "{}", canvas[0]);
     }
 
     #[test]

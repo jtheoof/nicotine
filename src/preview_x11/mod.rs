@@ -93,7 +93,7 @@ const PREVIEW_HEIGHT: u16 = 270;
 
 pub(crate) const TITLE_STRIP_HEIGHT: u16 = 24;
 pub(crate) const BORDER_WIDTH: u16 = 3;
-pub(crate) const TITLE_FONT_PX: f32 = 14.0;
+const TITLE_FONT_PX: f32 = 14.0;
 pub(crate) const TITLE_TEXT_LEFT_PAD: i16 = 10;
 
 // Drag / snap thresholds (DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX) live
@@ -103,9 +103,9 @@ pub(crate) const TITLE_TEXT_LEFT_PAD: i16 = 10;
 // Brand palette. Same RGB triples as the Windows preview chrome and the
 // (now-removed) Linux egui overlay so the look stays consistent across
 // platforms.
-pub(crate) const NICOTINE_RED: (u8, u8, u8) = (196, 30, 58);
-pub(crate) const CHROME_DARK: (u8, u8, u8) = (30, 30, 30);
-pub(crate) const NICOTINE_CREAM: (u8, u8, u8) = (252, 250, 242);
+const NICOTINE_RED: (u8, u8, u8) = (196, 30, 58);
+const CHROME_DARK: (u8, u8, u8) = (30, 30, 30);
+const NICOTINE_CREAM: (u8, u8, u8) = (252, 250, 242);
 const LIST_TEXT_BLACK: (u8, u8, u8) = (30, 30, 30);
 /// Brand gold used for the list-view window's perimeter border. Same
 /// hue as the (now-removed) egui overlay's frame so the list-view
