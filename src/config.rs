@@ -164,6 +164,20 @@ pub struct Config {
     pub window_width: u32,
     #[serde(default = "default_window_height")]
     pub window_height: u32,
+    /// Font for preview title text (Linux, Wayland previews): a font file
+    /// path, a fontconfig family name (e.g. "Noto Sans"), or
+    /// `eve:<font>` to use a font from the local EVE install, e.g.
+    /// `eve:evesansneue-regular`. Unset uses the bundled JetBrains Mono.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_font: Option<String>,
+    /// Preview title font size in pixels per em.
+    #[serde(default = "default_preview_font_size")]
+    pub preview_font_size: f32,
+    /// Preview title antialiasing: "auto" (subpixel when the monitor
+    /// reports an RGB/BGR layout, else grayscale), "grayscale", "rgb" or
+    /// "bgr".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_font_antialias: Option<String>,
 }
 
 #[cfg(unix)]
@@ -287,6 +301,10 @@ fn default_window_height() -> u32 {
     680
 }
 
+fn default_preview_font_size() -> f32 {
+    14.0
+}
+
 impl Config {
     /// Resolve the directory holding `config.toml`. Production callers
     /// get the platform-standard config dir (XDG on Linux, Roaming
@@ -397,6 +415,9 @@ impl Config {
             character_hotkeys: HashMap::new(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            preview_font: None,
+            preview_font_size: default_preview_font_size(),
+            preview_font_antialias: None,
         }
     }
 
@@ -456,6 +477,9 @@ mod tests {
             panel_height: 40,
             window_width: 720,
             window_height: 680,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -495,6 +519,9 @@ mod tests {
             panel_height: 0,
             window_width: 720,
             window_height: 680,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -533,6 +560,9 @@ mod tests {
             panel_height: 0,
             window_width: 900,
             window_height: 800,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,

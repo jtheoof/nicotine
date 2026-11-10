@@ -109,9 +109,10 @@ use crate::preview_common::{
 };
 use crate::preview_positions::PreviewPositions;
 use crate::preview_x11::{
-    jetbrains_mono, rasterize_text, thumbnail_size, BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM,
-    NICOTINE_RED, TITLE_FONT_PX, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
+    thumbnail_size, BORDER_WIDTH, CHROME_DARK, NICOTINE_CREAM, NICOTINE_RED, TITLE_STRIP_HEIGHT,
+    TITLE_TEXT_LEFT_PAD,
 };
+use crate::text_render::{self, Antialias, TextFont, TextMask};
 use crate::window_manager::{
     detect_display_server, detect_wayland_compositor, DisplayServer, WaylandCompositor,
     WindowManager,
@@ -158,16 +159,35 @@ pub fn should_use() -> bool {
 /// required global before returning, so an `Err` here means this backend
 /// can't run (missing protocol, no Wayland socket) and the caller can fall
 /// back to the X11 manager.
+/// Title-text settings from config.toml (read at startup).
+#[derive(Debug, Clone)]
+pub struct FontSettings {
+    pub font: Option<String>,
+    pub size_px: f32,
+    pub antialias: Option<String>,
+}
+
+impl FontSettings {
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            font: config.preview_font.clone(),
+            size_px: config.preview_font_size,
+            antialias: config.preview_font_antialias.clone(),
+        }
+    }
+}
+
 pub fn spawn(
     wm: Arc<dyn WindowManager>,
     state: Arc<Mutex<CycleState>>,
     live: Arc<Mutex<LiveSettings>>,
+    font: FontSettings,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
         .name("preview-wayland".into())
         .spawn(move || {
-            let (mut queue, mut manager) = match Manager::connect(wm, state, live) {
+            let (mut queue, mut manager) = match Manager::connect(wm, state, live, font) {
                 Ok(v) => {
                     let _ = tx.send(Ok(()));
                     v
@@ -294,7 +314,7 @@ struct Preview {
     alpha: Option<(WpAlphaModifierSurfaceV1, WpAlphaModifierSurfaceV1)>,
     /// Kept alive while the compositor shows it; sctk frees it on release.
     chrome_buf: Option<smithay_client_toolkit::shm::slot::Buffer>,
-    title_text: (Vec<u8>, u16, u16),
+    title_mask: TextMask,
     is_active: bool,
     capture: Capture,
     drag: DragState,
@@ -467,6 +487,10 @@ struct Manager {
     /// Character name of the focused EVE client, if any.
     active_character: Option<String>,
     capture_interval: Duration,
+    title_font: TextFont,
+    title_font_px: f32,
+    /// `None`: pick per output from its reported subpixel layout.
+    antialias: Option<Antialias>,
     last_applied_opacity: u32,
     needs_reconcile: bool,
     last_reconcile: Instant,
@@ -478,7 +502,20 @@ impl Manager {
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
+        font: FontSettings,
     ) -> Result<(EventQueue<Self>, Self)> {
+        let title_font = TextFont::load_or_bundled(font.font.as_deref());
+        let antialias = match font.antialias.as_deref() {
+            None => None,
+            Some(v) => Antialias::from_setting(v).unwrap_or_else(|| {
+                eprintln!("Unknown preview_font_antialias '{v}'; using auto");
+                None
+            }),
+        };
+        println!(
+            "Preview title font: {} at {} px/em",
+            title_font.source, font.size_px
+        );
         let conn = Connection::connect_to_env().context("connect to Wayland display")?;
         let (globals, mut queue) = registry_queue_init::<Self>(&conn).context("registry init")?;
         let qh = queue.handle();
@@ -555,6 +592,9 @@ impl Manager {
             next_offset: 0,
             active_character: None,
             capture_interval: Duration::from_secs(1) / capture_fps,
+            title_font,
+            title_font_px: font.size_px,
+            antialias,
             last_applied_opacity: 0,
             needs_reconcile: true,
             last_reconcile: Instant::now(),
@@ -711,6 +751,16 @@ impl Manager {
         }
     }
 
+    /// Antialiasing for text on `output`: subpixel when it reports a
+    /// horizontal RGB/BGR layout, grayscale otherwise.
+    fn output_antialias(&self, output: &WlOutput) -> Antialias {
+        match self.output_state.info(output).map(|i| i.subpixel) {
+            Some(wl_output::Subpixel::HorizontalRgb) => Antialias::SubpixelRgb,
+            Some(wl_output::Subpixel::HorizontalBgr) => Antialias::SubpixelBgr,
+            _ => Antialias::Grayscale,
+        }
+    }
+
     /// Every output with known logical geometry, in a stable order.
     fn output_rects(&self) -> Vec<(WlOutput, OutRect)> {
         self.output_state
@@ -845,7 +895,13 @@ impl Manager {
             thumb_viewport,
             alpha,
             chrome_buf: None,
-            title_text: rasterize_text(jetbrains_mono(), name, TITLE_FONT_PX),
+            title_mask: text_render::rasterize(
+                &self.title_font,
+                name,
+                self.title_font_px,
+                self.antialias
+                    .unwrap_or_else(|| self.output_antialias(&output)),
+            ),
             is_active: self.active_character.as_deref() == Some(name),
             capture: Capture {
                 source,
@@ -897,7 +953,7 @@ impl Manager {
         } else {
             CHROME_DARK
         };
-        paint_chrome(canvas, w as usize, h as usize, chrome, &p.title_text);
+        paint_chrome(canvas, w as usize, h as usize, chrome, &p.title_mask);
 
         let surface = p.layer.wl_surface();
         if buffer.attach_to(surface).is_err() {
@@ -1462,13 +1518,7 @@ fn apply_opacity(p: &Preview, percent: u32) {
 /// Paint title strip + border in `chrome`, the thumbnail well in black,
 /// and blend the pre-rasterized title text in cream. `canvas` is
 /// ARGB8888 little-endian (B, G, R, A byte order).
-fn paint_chrome(
-    canvas: &mut [u8],
-    w: usize,
-    h: usize,
-    chrome: (u8, u8, u8),
-    text: &(Vec<u8>, u16, u16),
-) {
+fn paint_chrome(canvas: &mut [u8], w: usize, h: usize, chrome: (u8, u8, u8), text: &TextMask) {
     let px = |c: (u8, u8, u8)| [c.2, c.1, c.0, 0xff];
     let chrome_px = px(chrome);
     let well_px = px((0, 0, 0));
@@ -1485,23 +1535,24 @@ fn paint_chrome(
         }
     }
 
-    let (alpha, tw, th) = (&text.0, text.1 as usize, text.2 as usize);
+    // Vertically centre the text box in the strip; clip to the strip and
+    // to the left/right padding.
     let left = TITLE_TEXT_LEFT_PAD as usize;
-    let top = title_h.saturating_sub(th) / 2;
-    let max_w = w.saturating_sub(left * 2);
-    for ty in 0..th.min(title_h) {
-        for tx in 0..tw.min(max_w) {
-            let a = alpha[ty * tw + tx] as u32;
-            if a == 0 {
-                continue;
-            }
-            let off = ((top + ty) * w + left + tx) * 4;
-            let blend = |bg: u8, fg: u8| ((bg as u32 * (255 - a) + fg as u32 * a) / 255) as u8;
-            canvas[off] = blend(chrome.2, NICOTINE_CREAM.2);
-            canvas[off + 1] = blend(chrome.1, NICOTINE_CREAM.1);
-            canvas[off + 2] = blend(chrome.0, NICOTINE_CREAM.0);
-        }
-    }
+    let top = title_h.saturating_sub(text.height) / 2;
+    let clipped = TextMask {
+        height: text.height.min(title_h.saturating_sub(top)),
+        ..text.clone()
+    };
+    text_render::blend_mask(
+        canvas,
+        w,
+        h,
+        left,
+        top,
+        w.saturating_sub(left * 2),
+        &clipped,
+        NICOTINE_CREAM,
+    );
 }
 
 // ============================================================================
@@ -2166,10 +2217,16 @@ mod tests {
             show_previews: true,
             hide_active_preview: false,
         }));
+        let font = FontSettings {
+            font: std::env::var("NICOTINE_TEST_FONT").ok(),
+            size_px: 14.0,
+            antialias: None,
+        };
         let (mut queue, mut m) = Manager::connect(
             Arc::new(NoWm),
             Arc::new(Mutex::new(CycleState::new())),
             live,
+            font,
         )
         .expect("bind Wayland globals");
         let qh = queue.handle();
@@ -2237,8 +2294,7 @@ mod tests {
     fn chrome_fills_strip_border_and_black_well() {
         let (w, h) = (40usize, 40usize);
         let mut canvas = vec![0u8; w * h * 4];
-        let no_text = (Vec::new(), 0u16, 0u16);
-        paint_chrome(&mut canvas, w, h, NICOTINE_RED, &no_text);
+        paint_chrome(&mut canvas, w, h, NICOTINE_RED, &TextMask::default());
         let at = |x: usize, y: usize| &canvas[(y * w + x) * 4..(y * w + x) * 4 + 4];
         let red = [NICOTINE_RED.2, NICOTINE_RED.1, NICOTINE_RED.0, 0xff];
         // Title strip, left border, bottom border are chrome-colored.
@@ -2253,7 +2309,13 @@ mod tests {
     fn chrome_text_blends_toward_cream() {
         let (w, h) = (40usize, 40usize);
         let mut canvas = vec![0u8; w * h * 4];
-        let text = (vec![255u8; 4], 2u16, 2u16);
+        let text = TextMask {
+            width: 2,
+            height: 2,
+            baseline: 2,
+            subpixel: false,
+            data: vec![255; 4],
+        };
         paint_chrome(&mut canvas, w, h, CHROME_DARK, &text);
         let top = (TITLE_STRIP_HEIGHT as usize - 2) / 2;
         let off = (top * w + TITLE_TEXT_LEFT_PAD as usize) * 4;

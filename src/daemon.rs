@@ -305,6 +305,7 @@ impl Daemon {
                 Arc::clone(&self.wm),
                 Arc::clone(&self.state),
                 Arc::clone(&self.live),
+                crate::preview_wayland::FontSettings::from_config(&self.config),
             ) {
                 Ok(()) => return,
                 Err(e) => eprintln!(

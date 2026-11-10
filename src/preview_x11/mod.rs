@@ -136,7 +136,7 @@ use preview::OwnedPreview;
 use render::*;
 // Shared with the Wayland-native preview backend (`preview_wayland`) so both
 // draw identical chrome.
-pub(crate) use render::{jetbrains_mono, rasterize_text, thumbnail_size};
+pub(crate) use render::thumbnail_size;
 
 /// Total height of the list window for `n` character rows. Includes
 /// the 2-px gold border top and bottom, the red title strip, the

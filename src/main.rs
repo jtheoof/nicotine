@@ -35,6 +35,8 @@ mod preview_wayland;
 #[cfg(unix)]
 mod preview_x11;
 #[cfg(unix)]
+mod text_render;
+#[cfg(unix)]
 mod wayland_backends;
 #[cfg(unix)]
 mod x11_manager;

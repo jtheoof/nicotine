@@ -41,7 +41,7 @@ pub(super) fn xcolor(rgb: (u8, u8, u8), alpha: u16) -> RenderColor {
 /// every preview's text rasterization. Bundled into preview chrome so we
 /// don't depend on system fontconfig — same font shows up regardless of
 /// the user's distro / Wayland font setup.
-pub(crate) fn jetbrains_mono() -> &'static FontRef<'static> {
+pub(super) fn jetbrains_mono() -> &'static FontRef<'static> {
     static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
     FONT.get_or_init(|| {
         FontRef::try_from_slice(include_bytes!(
@@ -152,7 +152,7 @@ pub(super) fn pick_argb32_format(reply: &render::QueryPictFormatsReply) -> Optio
 /// Rasterize `text` at `font_px` into a packed alpha buffer using
 /// `font`. Returns (bytes, width, height). Each byte is the coverage
 /// (0–255) for one pixel; row-major, no padding.
-pub(crate) fn rasterize_text(font: &FontRef<'_>, text: &str, font_px: f32) -> (Vec<u8>, u16, u16) {
+pub(super) fn rasterize_text(font: &FontRef<'_>, text: &str, font_px: f32) -> (Vec<u8>, u16, u16) {
     let scaled = font.as_scaled(PxScale::from(font_px));
     let ascent = scaled.ascent();
     let descent = scaled.descent();

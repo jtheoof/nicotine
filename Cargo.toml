@@ -90,6 +90,9 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # instead of a GPU->CPU readback into shm plus a re-upload. Links libgbm
 # (mesa); default features off since we only allocate, never import.
 gbm = { version = "0.18", default-features = false }
+# Hinted (TrueType + CFF) glyph rasterization, shaping and subpixel AA for
+# the Wayland preview titles. Already in the tree via iced's text stack.
+swash = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [
