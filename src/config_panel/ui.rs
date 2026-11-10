@@ -10,10 +10,32 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE, LOGO_SIZE,
-    MODIFIER_CHOICES, NICOTINE_BLACK, NICOTINE_CREAM, NICOTINE_GOLD, NICOTINE_GREEN, NICOTINE_RED,
-    SECTION_SIZE,
+    code_to_label, color, palette, CaptureTarget, Message, OutputPick, Panel, SliderField, Tab,
+    CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES, SECTION_SIZE,
 };
+
+// Theme colours by role (see `crate::theme::PanelPalette`).
+fn accent() -> Color {
+    color(palette().accent)
+}
+fn on_accent() -> Color {
+    color(palette().on_accent)
+}
+fn bg() -> Color {
+    color(palette().background)
+}
+fn surface() -> Color {
+    color(palette().surface)
+}
+fn ink() -> Color {
+    color(palette().text)
+}
+fn subtle() -> Color {
+    color(palette().subtle)
+}
+fn success() -> Color {
+    color(palette().success)
+}
 
 const LOGO_FONT: Font = Font::with_name("Marlboro");
 const BOLD: Font = Font {
@@ -36,20 +58,20 @@ pub(super) fn header() -> Element<'static, Message> {
             text("Nicotine")
                 .font(LOGO_FONT)
                 .size(LOGO_SIZE)
-                .color(NICOTINE_CREAM),
+                .color(on_accent()),
         )
         .on_press(Message::LogoClicked),
     )
     .center_x(Length::Fill)
     .center_y(Length::Fixed(72.0))
-    .style(|_| filled(NICOTINE_RED))
+    .style(|_| filled(accent()))
     .into()
 }
 
 pub(super) fn footer() -> Element<'static, Message> {
     let links = row![
         link_button("GITHUB", "https://github.com/isomerc"),
-        text("•").size(CAPTION_SIZE).color(NICOTINE_GOLD),
+        text("•").size(CAPTION_SIZE).color(subtle()),
         link_button(
             "ILLUMINATED IS RECRUITING",
             "https://www.illuminatedcorp.com"
@@ -64,7 +86,7 @@ pub(super) fn footer() -> Element<'static, Message> {
         }
         Some(crate::version_check::UpdateStatus::UpToDate) => text("LATEST VERSION")
             .size(CAPTION_SIZE)
-            .color(NICOTINE_GREEN)
+            .color(success())
             .font(BOLD)
             .into(),
         None => Space::new().into(),
@@ -74,7 +96,7 @@ pub(super) fn footer() -> Element<'static, Message> {
         container(row![links, Space::new().width(Length::Fill), badge].align_y(Alignment::Center))
             .width(Length::Fill)
             .padding([10, 16])
-            .style(|_| filled(NICOTINE_CREAM));
+            .style(|_| filled(bg()));
 
     column![divider(), bar].into()
 }
@@ -84,7 +106,7 @@ fn link_button(label: impl Into<String>, url: impl Into<String>) -> Element<'sta
     button(
         text(label.into())
             .size(CAPTION_SIZE)
-            .color(NICOTINE_RED)
+            .color(accent())
             .font(BOLD),
     )
     .style(button::text)
@@ -109,7 +131,7 @@ pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
         .padding(8)
         .width(Length::Fixed(150.0))
         .height(Length::Fill)
-        .style(|_| filled(NICOTINE_CREAM))
+        .style(|_| filled(bg()))
         .into()
 }
 
@@ -121,11 +143,11 @@ fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, M
         .style(move |_theme, status| {
             // Press is styled like hover, so clicking a tab doesn't flash.
             let (bg, fg) = if active {
-                (NICOTINE_RED, NICOTINE_CREAM)
+                (accent(), on_accent())
             } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                (NICOTINE_GOLD, NICOTINE_BLACK)
+                (subtle(), ink())
             } else {
-                (NICOTINE_CREAM, NICOTINE_BLACK)
+                (bg(), ink())
             };
             button::Style {
                 background: Some(Background::Color(bg)),
@@ -139,7 +161,7 @@ fn tab_button(label: &'static str, tab: Tab, active: bool) -> Element<'static, M
 pub(super) fn vdivider() -> Element<'static, Message> {
     container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
         .height(Length::Fill)
-        .style(|_| filled(NICOTINE_GOLD))
+        .style(|_| filled(subtle()))
         .into()
 }
 
@@ -159,10 +181,7 @@ pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
 
 fn section_header(label: &'static str) -> Element<'static, Message> {
     column![
-        text(label)
-            .size(SECTION_SIZE)
-            .color(NICOTINE_RED)
-            .font(BOLD),
+        text(label).size(SECTION_SIZE).color(accent()).font(BOLD),
         divider(),
     ]
     .spacing(4)
@@ -172,20 +191,21 @@ fn section_header(label: &'static str) -> Element<'static, Message> {
 fn divider() -> Element<'static, Message> {
     container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
         .width(Length::Fill)
-        .style(|_| filled(NICOTINE_GOLD))
+        .style(|_| filled(subtle()))
         .into()
 }
 
 fn caption(s: &'static str) -> Element<'static, Message> {
-    text(s).size(CAPTION_SIZE).color(NICOTINE_BLACK).into()
+    text(s).size(CAPTION_SIZE).color(ink()).into()
 }
 
 /// Drag handle for a cycle-list row — press and drag it to reorder.
 fn grip(i: usize) -> Element<'static, Message> {
-    mouse_area(text("≡").size(SECTION_SIZE).color(Color {
-        a: 0.55,
-        ..NICOTINE_BLACK
-    }))
+    mouse_area(
+        text("≡")
+            .size(SECTION_SIZE)
+            .color(Color { a: 0.55, ..ink() }),
+    )
     .on_press(Message::GrabRow(i))
     .into()
 }
@@ -194,18 +214,18 @@ fn grip(i: usize) -> Element<'static, Message> {
 /// as a white card; the row under the cursor becomes a soft gold drop slot.
 fn drag_row_style(is_dragged: bool, is_target: bool) -> container::Style {
     let gold_border = Border {
-        color: NICOTINE_GOLD,
+        color: subtle(),
         width: 1.0,
         radius: 6.0_f32.into(),
     };
     if is_dragged {
         container::Style {
-            background: Some(Background::Color(Color::WHITE)),
+            background: Some(Background::Color(surface())),
             border: gold_border,
             shadow: Shadow {
                 color: Color {
                     a: 0.18,
-                    ..NICOTINE_BLACK
+                    ..Color::BLACK
                 },
                 offset: Vector { x: 0.0, y: 2.0 },
                 blur_radius: 8.0,
@@ -216,7 +236,7 @@ fn drag_row_style(is_dragged: bool, is_target: bool) -> container::Style {
         container::Style {
             background: Some(Background::Color(Color {
                 a: 0.15,
-                ..NICOTINE_GOLD
+                ..subtle()
             })),
             border: gold_border,
             ..container::Style::default()
@@ -248,11 +268,18 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
             ),
         ]
         .spacing(16),
+    ]
+    .spacing(8);
+
+    if let Some(picker) = preview_output_picker(panel) {
+        col = col.push(picker);
+    }
+
+    col = col.push(
         checkbox(panel.config.positions_locked)
             .label("Lock positions (drag disabled on previews and list)")
             .on_toggle(Message::LockToggled),
-    ]
-    .spacing(8);
+    );
 
     // Hidden on GNOME Wayland, where the compositor blocks window
     // positioning so restacking can't do anything.
@@ -261,6 +288,46 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
     }
 
     col.into()
+}
+
+/// "Preview monitor" picker: Auto or a specific monitor. Only shown when
+/// the preview manager publishes monitors (Wayland previews).
+fn preview_output_picker(panel: &Panel) -> Option<Element<'_, Message>> {
+    let outputs = panel.live.lock().unwrap().outputs.clone();
+    if outputs.is_empty() {
+        return None;
+    }
+    let mut options = vec![OutputPick::Auto];
+    options.extend(outputs.iter().map(|o| OutputPick::Output {
+        name: o.name.clone(),
+        label: o.label.clone(),
+    }));
+    let selected = match &panel.config.preview_output {
+        None => OutputPick::Auto,
+        Some(name) => options
+            .iter()
+            .find(|o| matches!(o, OutputPick::Output { name: n, .. } if n == name))
+            .cloned()
+            .unwrap_or_else(|| {
+                // Configured monitor isn't connected right now; keep it
+                // selectable so the setting isn't silently changed.
+                let missing = OutputPick::Output {
+                    name: name.clone(),
+                    label: format!("{name} (not connected)"),
+                };
+                options.push(missing.clone());
+                missing
+            }),
+    };
+    Some(
+        row![
+            text("Preview monitor"),
+            pick_list(options, Some(selected), Message::PreviewOutputChanged),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into(),
+    )
 }
 
 fn characters_section(panel: &Panel) -> Element<'_, Message> {
@@ -557,10 +624,10 @@ fn bind_button(
             if is_capturing {
                 // Armed and listening for the next key.
                 button::Style {
-                    background: Some(Background::Color(NICOTINE_GOLD)),
-                    text_color: NICOTINE_BLACK,
+                    background: Some(Background::Color(subtle())),
+                    text_color: ink(),
                     border: Border {
-                        color: NICOTINE_RED,
+                        color: accent(),
                         width: 1.5,
                         radius: 4.0_f32.into(),
                     },
@@ -571,13 +638,13 @@ fn bind_button(
                 let background =
                     matches!(status, button::Status::Hovered).then_some(Background::Color(Color {
                         a: 0.18,
-                        ..NICOTINE_GOLD
+                        ..subtle()
                     }));
                 button::Style {
                     background,
-                    text_color: NICOTINE_BLACK,
+                    text_color: ink(),
                     border: Border {
-                        color: NICOTINE_GOLD,
+                        color: subtle(),
                         width: 1.0,
                         radius: 4.0_f32.into(),
                     },

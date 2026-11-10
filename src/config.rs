@@ -54,6 +54,24 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Monitor (connector name, e.g. "DP-1") previews are placed on;
+    /// `None` = auto (each preview follows its EVE client's monitor).
+    /// Applied live by the Wayland preview manager.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub preview_output: Option<String>,
+    /// Monitors previews can be placed on, published by the Wayland
+    /// preview manager for the panel's picker. Empty where per-monitor
+    /// placement isn't supported (the panel hides the picker).
+    pub outputs: Vec<OutputChoice>,
+}
+
+/// A monitor the preview manager can place previews on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChoice {
+    /// Connector name, stored in config (`preview_output`).
+    pub name: String,
+    /// Human-readable label for the picker, e.g. "DP-3 · LG ULTRAGEAR+".
+    pub label: String,
 }
 
 impl LiveSettings {
@@ -66,6 +84,8 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            preview_output: config.preview_output.clone(),
+            outputs: Vec::new(),
         }))
     }
 }
@@ -164,6 +184,58 @@ pub struct Config {
     pub window_width: u32,
     #[serde(default = "default_window_height")]
     pub window_height: u32,
+    /// Font for preview title text (Linux, Wayland previews): a font file
+    /// path, a fontconfig family name (e.g. "Noto Sans"), or
+    /// `eve:<font>` to use a font from the local EVE install, e.g.
+    /// `eve:evesansneue-regular`. Unset uses the bundled JetBrains Mono.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_font: Option<String>,
+    /// Preview title font size in pixels per em.
+    #[serde(default = "default_preview_font_size")]
+    pub preview_font_size: f32,
+    /// Preview title antialiasing: "auto" (subpixel when the monitor
+    /// reports an RGB/BGR layout, else grayscale), "grayscale", "rgb" or
+    /// "bgr".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_font_antialias: Option<String>,
+    /// App colour theme for the config panel and the (Linux, Wayland)
+    /// preview chrome: "nicotine" (default), "nord" / "nord-dark", or
+    /// "nord-light". `preview_theme` is accepted as an older name.
+    #[serde(
+        default,
+        alias = "preview_theme",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub theme: Option<String>,
+    /// Per-colour preview-chrome overrides on top of `theme`, as "#RRGGBB".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_colors: Option<PreviewColors>,
+    /// Monitor previews are placed on, by connector name (e.g. "DP-1").
+    /// Unset = auto: each preview stays on its EVE client's monitor and
+    /// follows it if the client moves. Linux Wayland previews only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_output: Option<String>,
+}
+
+/// `[preview_colors]` table: optional "#RRGGBB" overrides for the preview
+/// chrome theme. Unset keys keep the theme's colour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewColors {
+    /// Title strip and border of the focused client's preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Title text on the active strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_text: Option<String>,
+    /// Title strip and border of other previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<String>,
+    /// Title text on inactive strips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Thumbnail area before the first frame arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
 }
 
 #[cfg(unix)]
@@ -287,6 +359,10 @@ fn default_window_height() -> u32 {
     680
 }
 
+fn default_preview_font_size() -> f32 {
+    14.0
+}
+
 impl Config {
     /// Resolve the directory holding `config.toml`. Production callers
     /// get the platform-standard config dir (XDG on Linux, Roaming
@@ -397,6 +473,12 @@ impl Config {
             character_hotkeys: HashMap::new(),
             window_width: default_window_width(),
             window_height: default_window_height(),
+            preview_font: None,
+            preview_font_size: default_preview_font_size(),
+            preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
+            preview_output: None,
         }
     }
 
@@ -456,6 +538,12 @@ mod tests {
             panel_height: 40,
             window_width: 720,
             window_height: 680,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
+            preview_output: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -495,6 +583,12 @@ mod tests {
             panel_height: 0,
             window_width: 720,
             window_height: 680,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
+            preview_output: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -533,6 +627,12 @@ mod tests {
             panel_height: 0,
             window_width: 900,
             window_height: 800,
+            preview_font: None,
+            preview_font_size: 14.0,
+            preview_font_antialias: None,
+            theme: None,
+            preview_colors: None,
+            preview_output: None,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,
@@ -595,5 +695,35 @@ mod tests {
             deserialized.window_height, 800,
             "window_height must survive a save/load round-trip"
         );
+    }
+
+    #[test]
+    fn theme_and_preview_colors_round_trip() {
+        let mut config = Config::build_default(2560, 1440);
+        config.theme = Some("nord-light".into());
+        config.preview_colors = Some(PreviewColors {
+            active: Some("#BF616A".into()),
+            ..Default::default()
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[preview_colors]"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.theme.as_deref(), Some("nord-light"));
+        assert_eq!(back.preview_colors, config.preview_colors);
+
+        // Unset theme settings stay out of the file entirely.
+        let plain = toml::to_string_pretty(&Config::build_default(2560, 1440)).unwrap();
+        assert!(!plain.contains("theme") && !plain.contains("preview_colors"));
+    }
+
+    #[test]
+    fn preview_theme_is_accepted_as_old_name_for_theme() {
+        let mut text = toml::to_string_pretty(&Config::build_default(2560, 1440)).unwrap();
+        text.insert_str(0, "preview_theme = \"nord\"\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.theme.as_deref(), Some("nord"));
+        // Saved back under the new name.
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("theme = \"nord\"") && !saved.contains("preview_theme"));
     }
 }

@@ -66,7 +66,7 @@ pub(super) fn marlboro() -> &'static FontRef<'static> {
 /// (Width, height) of the thumbnail area within a preview window.
 /// Subtracts the title strip from the top and the border on left,
 /// right, and bottom.
-pub(super) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
+pub(crate) fn thumbnail_size(window_w: u16, window_h: u16) -> (u16, u16) {
     let w = window_w.saturating_sub(BORDER_WIDTH * 2);
     let h = window_h
         .saturating_sub(TITLE_STRIP_HEIGHT)

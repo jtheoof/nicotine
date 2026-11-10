@@ -1,5 +1,7 @@
 use crate::config::{CharacterHotkey, Config, LiveSettings};
 use iced::{Color, Element, Subscription, Task, Theme};
+
+use crate::theme::PanelPalette;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,37 +13,18 @@ mod ui;
 /// write rather than hammering disk on every pixel / keystroke.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-// ---- Brand palette (matches the Linux preview/list windows). ----
-pub(super) const NICOTINE_RED: Color = Color {
-    r: 196.0 / 255.0,
-    g: 30.0 / 255.0,
-    b: 58.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_GOLD: Color = Color {
-    r: 180.0 / 255.0,
-    g: 155.0 / 255.0,
-    b: 105.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_CREAM: Color = Color {
-    r: 252.0 / 255.0,
-    g: 250.0 / 255.0,
-    b: 242.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_BLACK: Color = Color {
-    r: 30.0 / 255.0,
-    g: 30.0 / 255.0,
-    b: 30.0 / 255.0,
-    a: 1.0,
-};
-pub(super) const NICOTINE_GREEN: Color = Color {
-    r: 60.0 / 255.0,
-    g: 140.0 / 255.0,
-    b: 70.0 / 255.0,
-    a: 1.0,
-};
+// ---- Colours: the configured app theme's panel palette (`theme` in
+// config.toml), fixed for the panel's lifetime. Defaults to the Nicotine
+// brand palette if read before `run` sets it (e.g. in tests). ----
+static PALETTE: std::sync::OnceLock<PanelPalette> = std::sync::OnceLock::new();
+
+pub(super) fn palette() -> &'static PanelPalette {
+    PALETTE.get_or_init(|| crate::theme::Theme::NICOTINE.panel)
+}
+
+pub(super) fn color(rgb: crate::theme::Rgb) -> Color {
+    Color::from_rgb8(rgb.0, rgb.1, rgb.2)
+}
 
 // ---- Type scale (logical px). One deliberate set of sizes. ----
 // TEXT_SIZE is the app-wide default (set in `run`); everything interactive
@@ -244,6 +227,7 @@ pub(super) struct Panel {
     /// Bounds the post-launch poll so it can't spin forever if the check
     /// never returns (e.g. offline).
     pub version_polls: u8,
+    pub outputs_polls: u32,
     /// In-progress text for each editable slider readout, keyed by field.
     /// Mirrors the value except while the user is typing, until they press
     /// Enter (commit) or drag the slider (re-sync).
@@ -304,6 +288,7 @@ impl Panel {
             dragging: None,
             drag_hover: None,
             version_polls: 0,
+            outputs_polls: 0,
         }
     }
 
@@ -380,9 +365,30 @@ impl Panel {
     }
 }
 
+/// Entry in the "Preview monitor" picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OutputPick {
+    /// Each preview on its EVE client's monitor.
+    Auto,
+    Output {
+        name: String,
+        label: String,
+    },
+}
+
+impl std::fmt::Display for OutputPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputPick::Auto => f.write_str("Auto (EVE client's monitor)"),
+            OutputPick::Output { label, .. } => f.write_str(label),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum Message {
     DisplayModeChanged(crate::config::DisplayMode),
+    PreviewOutputChanged(OutputPick),
     LockToggled(bool),
     RestackClicked,
     LogoClicked,
@@ -418,6 +424,7 @@ pub(super) enum Message {
     OpenLink(String),
     FlushIfIdle,
     VersionPoll,
+    OutputsPoll,
     WindowResized(u32, u32),
     CloseRequested,
 }
@@ -428,6 +435,20 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.config.display_mode = mode;
             panel.live.lock().unwrap().display_mode = mode;
             panel.touch();
+        }
+        Message::PreviewOutputChanged(pick) => {
+            let name = match pick {
+                OutputPick::Auto => None,
+                OutputPick::Output { name, .. } => Some(name),
+            };
+            panel.config.preview_output = name.clone();
+            panel.live.lock().unwrap().preview_output = name;
+            panel.touch();
+        }
+        Message::OutputsPoll => {
+            // Re-render so the monitor picker appears once the preview
+            // manager has published the outputs.
+            panel.outputs_polls = panel.outputs_polls.saturating_add(1);
         }
         Message::LockToggled(v) => {
             panel.config.positions_locked = v;
@@ -728,16 +749,20 @@ fn view(panel: &Panel) -> Element<'_, Message> {
     .into()
 }
 
+/// iced palette for built-in widgets (checkboxes, sliders, inputs, pick
+/// lists, plain buttons); iced derives their hover/weak/strong shades from
+/// it, including dark-background variants.
 fn theme(_panel: &Panel) -> Theme {
+    let p = palette();
     Theme::custom(
         "Nicotine".to_string(),
         iced::theme::Palette {
-            background: NICOTINE_CREAM,
-            text: NICOTINE_BLACK,
-            primary: NICOTINE_RED,
-            success: NICOTINE_GREEN,
-            warning: NICOTINE_GOLD,
-            danger: NICOTINE_RED,
+            background: color(p.background),
+            text: color(p.text),
+            primary: color(p.accent),
+            success: color(p.success),
+            warning: color(p.subtle),
+            danger: color(p.danger),
         },
     )
 }
@@ -767,6 +792,11 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     }
     // Re-render a few times after launch so the async version-check result
     // appears once it lands (iced only redraws on events, unlike egui).
+    // Same for the monitor list the preview manager publishes shortly
+    // after startup (Wayland previews only; stays empty elsewhere).
+    if panel.outputs_polls < 20 && panel.live.lock().unwrap().outputs.is_empty() {
+        subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::OutputsPoll));
+    }
     if panel.version_polls < 20 && crate::version_check::get_update_status().is_none() {
         subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Message::VersionPoll));
     }
@@ -1170,6 +1200,7 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
         iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok();
 
     let audio = crate::audio::spawn();
+    let _ = PALETTE.set(crate::theme::Theme::named(config.theme.as_deref()).panel);
 
     // `mut` is only used on Linux (the app_id assignment below); on other
     // platforms the binding is never mutated, so allow the unused-mut lint

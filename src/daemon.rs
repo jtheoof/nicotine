@@ -295,6 +295,28 @@ impl Daemon {
         // or the toggle-previews hotkey. The reconcile loop is cheap when
         // dark (no windows, early return). Failure to start is non-fatal;
         // cycling and the config panel keep working.
+        //
+        // On Hyprland the Wayland-native manager runs instead: it can see
+        // native Wayland EVE clients (PROTON_ENABLE_WAYLAND=1), which are
+        // invisible to XComposite. If it can't start (missing protocol),
+        // fall back to the X11 manager.
+        if crate::preview_wayland::should_use() {
+            match crate::preview_wayland::spawn(
+                Arc::clone(&self.wm),
+                Arc::clone(&self.state),
+                Arc::clone(&self.live),
+                crate::preview_wayland::FontSettings::from_config(&self.config),
+                crate::theme::PreviewTheme::from_config(
+                    self.config.theme.as_deref(),
+                    self.config.preview_colors.as_ref(),
+                ),
+            ) {
+                Ok(()) => return,
+                Err(e) => eprintln!(
+                    "Warning: Wayland preview manager unavailable ({e:#}); falling back to X11 previews"
+                ),
+            }
+        }
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
         let live_clone = Arc::clone(&self.live);

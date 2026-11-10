@@ -18,6 +18,7 @@ mod paths;
 mod preview_common;
 mod preview_positions;
 mod telemetry;
+mod theme;
 mod window_manager;
 
 mod version_check;
@@ -31,7 +32,11 @@ mod mouse_listener;
 #[cfg(unix)]
 mod pointer_nudge;
 #[cfg(unix)]
+mod preview_wayland;
+#[cfg(unix)]
 mod preview_x11;
+#[cfg(unix)]
+mod text_render;
 #[cfg(unix)]
 mod wayland_backends;
 #[cfg(unix)]

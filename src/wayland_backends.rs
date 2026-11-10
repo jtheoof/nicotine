@@ -538,38 +538,237 @@ impl WindowManager for SwayManager {
 // ============================================================================
 // Hyprland Backend (via hyprctl)
 // ============================================================================
+//
+// Hyprland identifies windows by their 64-bit address (e.g.
+// `0x55eb4b6c12e0`, a heap pointer inside the compositor), but the
+// cross-platform `EveWindow.id` is a `u32`. We use the address's low 32
+// bits as the id (the same convention Hyprland's own toplevel-export
+// protocol uses for window handles) and keep a low32 → full-address map so
+// dispatches can name the real window. Parsing the full address straight
+// into a `u32` overflowed for every real window, collapsing all ids to 0
+// and making every dispatch target `address:0x0`.
+//
+// Hyprland 0.57 moved to a Lua config: `hyprctl dispatch <args>` now
+// evaluates `hl.dispatch(<args>)`, so the classic `dispatch focuswindow
+// address:0x…` form is a Lua syntax error. The syntax is detected once at
+// startup (`hyprctl eval` only exists on Lua builds) and every dispatch is
+// built in both forms. Lua dispatches always name their target window
+// explicitly: some (e.g. `hl.dsp.window.float`) act on the focused window
+// when not told otherwise. hyprctl reports errors on stdout, so that's what
+// failures surface.
 
-pub struct HyprlandManager;
+/// Parse a Hyprland address string (`0x…` hex) into its full 64-bit value.
+fn parse_hypr_address(address: &str) -> Option<u64> {
+    let hex = address.strip_prefix("0x").unwrap_or(address);
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Low 32 bits of a Hyprland address — the `u32` window id we hand out.
+fn hypr_window_id(address: u64) -> u32 {
+    address as u32
+}
+
+/// How `hyprctl dispatch` takes its arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchSyntax {
+    /// `hyprctl dispatch focuswindow address:0x…` (Hyprland < 0.57).
+    Legacy,
+    /// `hyprctl dispatch 'hl.dsp.focus({ window = "address:0x…" })'`.
+    Lua,
+}
+
+/// One dispatcher call, in both syntaxes. `sel` is an `address:0x…`
+/// selector (hex digits only, so safe inside a Lua string literal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HyprDispatch {
+    legacy: Vec<String>,
+    lua: String,
+}
+
+impl HyprDispatch {
+    fn focus(sel: &str) -> Self {
+        Self {
+            legacy: vec!["focuswindow".into(), sel.into()],
+            lua: format!(r#"hl.dsp.focus({{ window = "{sel}" }})"#),
+        }
+    }
+
+    /// Make the window floating (idempotent, unlike `togglefloating`).
+    fn float(sel: &str) -> Self {
+        Self {
+            legacy: vec!["setfloating".into(), sel.into()],
+            lua: format!(r#"hl.dsp.window.float({{ action = "enable", window = "{sel}" }})"#),
+        }
+    }
+
+    fn move_to(sel: &str, x: i32, y: i32) -> Self {
+        Self {
+            legacy: vec!["movewindowpixel".into(), format!("exact {x} {y},{sel}")],
+            lua: format!(r#"hl.dsp.window.move({{ x = {x}, y = {y}, window = "{sel}" }})"#),
+        }
+    }
+
+    fn resize_to(sel: &str, w: i32, h: i32) -> Self {
+        Self {
+            legacy: vec!["resizewindowpixel".into(), format!("exact {w} {h},{sel}")],
+            lua: format!(r#"hl.dsp.window.resize({{ x = {w}, y = {h}, window = "{sel}" }})"#),
+        }
+    }
+
+    /// Hide on the special workspace without switching to it.
+    fn to_special(sel: &str) -> Self {
+        Self {
+            legacy: vec!["movetoworkspacesilent".into(), format!("special,{sel}")],
+            lua: format!(r#"hl.dsp.window.move({{ workspace = "special", window = "{sel}" }})"#),
+        }
+    }
+
+    /// Bring back to the current workspace.
+    fn to_current_workspace(sel: &str) -> Self {
+        Self {
+            legacy: vec!["movetoworkspace".into(), format!("e+0,{sel}")],
+            lua: format!(r#"hl.dsp.window.move({{ workspace = "e+0", window = "{sel}" }})"#),
+        }
+    }
+
+    fn args(&self, syntax: DispatchSyntax) -> Vec<String> {
+        let mut args = vec!["dispatch".to_string()];
+        match syntax {
+            DispatchSyntax::Legacy => args.extend(self.legacy.iter().cloned()),
+            DispatchSyntax::Lua => args.push(self.lua.clone()),
+        }
+        args
+    }
+}
+
+/// Did a `hyprctl` command fail? hyprctl prints errors (bad dispatch
+/// syntax, unknown window, unreachable socket) on stdout, sometimes with
+/// a zero exit status, so both are checked. Returns the message to report.
+fn hyprctl_failure(success: bool, stdout: &str, stderr: &str) -> Option<String> {
+    let out = stdout.trim();
+    let bad_line = out.lines().any(|line| {
+        let line = line.trim_start().to_ascii_lowercase();
+        ["error", "warning", "invalid", "couldn't connect", "no such"]
+            .iter()
+            .any(|p| line.starts_with(p))
+    });
+    (!success || bad_line).then(|| {
+        let msg = if out.is_empty() { stderr.trim() } else { out };
+        if msg.is_empty() {
+            "hyprctl failed with no output".to_string()
+        } else {
+            msg.to_string()
+        }
+    })
+}
+
+/// Run `hyprctl <args>`, returning stdout or the reported failure.
+fn run_hyprctl(args: &[String]) -> Result<Vec<u8>> {
+    let output = Command::new("hyprctl")
+        .args(args)
+        .output()
+        .context("Failed to execute hyprctl")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // JSON replies can contain these words inside values; only text
+    // replies are scanned for error lines.
+    let is_json = args.iter().any(|a| a == "-j");
+    let failure = if is_json {
+        (!output.status.success()).then(|| {
+            hyprctl_failure(false, &stdout, &String::from_utf8_lossy(&output.stderr))
+                .unwrap_or_default()
+        })
+    } else {
+        hyprctl_failure(
+            output.status.success(),
+            &stdout,
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    };
+    match failure {
+        Some(msg) => anyhow::bail!("hyprctl {}: {msg}", args.join(" ")),
+        None => Ok(output.stdout),
+    }
+}
+
+pub struct HyprlandManager {
+    /// low32 id → full address, refreshed on every enumeration.
+    addresses: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+    syntax: DispatchSyntax,
+}
 
 impl HyprlandManager {
     pub fn new() -> Result<Self> {
-        // Verify hyprctl is available
-        Command::new("hyprctl")
-            .arg("version")
-            .output()
-            .context("hyprctl not found. Make sure you're running Hyprland")?;
+        run_hyprctl(&["version".into()]).context(
+            "hyprctl can't reach Hyprland (not running, or a stale \
+             HYPRLAND_INSTANCE_SIGNATURE in this shell?)",
+        )?;
+        // `eval` exists only on Lua-config Hyprland (0.57+), where it
+        // replies "ok"; older builds reject it as an unknown request.
+        let syntax = match run_hyprctl(&["eval".into(), "return 1".into()]) {
+            Ok(out) if String::from_utf8_lossy(&out).trim() == "ok" => DispatchSyntax::Lua,
+            _ => DispatchSyntax::Legacy,
+        };
+        println!("Hyprland dispatch syntax: {syntax:?}");
 
-        Ok(Self)
+        Ok(Self {
+            addresses: std::sync::Mutex::new(std::collections::HashMap::new()),
+            syntax,
+        })
+    }
+
+    fn dispatch(&self, d: HyprDispatch) -> Result<()> {
+        run_hyprctl(&d.args(self.syntax)).map(|_| ())
     }
 
     fn get_all_windows(&self) -> Result<Vec<Value>> {
-        let output = Command::new("hyprctl")
-            .arg("clients")
-            .arg("-j")
-            .output()
-            .context("Failed to execute hyprctl")?;
+        let out = run_hyprctl(&["clients".into(), "-j".into()])?;
+        serde_json::from_slice(&out).context("Failed to parse hyprctl output")
+    }
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "hyprctl failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    /// Full address of the focused window, if any.
+    fn active_address(&self) -> Option<u64> {
+        let out = run_hyprctl(&["activewindow".into(), "-j".into()]).ok()?;
+        let window: Value = serde_json::from_slice(&out).ok()?;
+        window
+            .get("address")
+            .and_then(|a| a.as_str())
+            .and_then(parse_hypr_address)
+    }
 
-        let windows: Vec<Value> =
-            serde_json::from_slice(&output.stdout).context("Failed to parse hyprctl output")?;
+    /// Record `address` under its low32 id and return that id.
+    fn remember(&self, address: u64) -> u32 {
+        let id = hypr_window_id(address);
+        self.addresses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, address);
+        id
+    }
 
-        Ok(windows)
+    /// Resolve a `u32` window id back to the `address:0x…` selector
+    /// hyprctl dispatches expect. Falls back to a fresh `hyprctl clients`
+    /// scan when the id isn't cached (e.g. a one-shot CLI command).
+    fn selector(&self, window_id: u32) -> Result<String> {
+        let cached = self
+            .addresses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&window_id)
+            .copied();
+        let address = match cached {
+            Some(a) => a,
+            None => self
+                .get_all_windows()?
+                .iter()
+                .filter_map(|w| w.get("address").and_then(|a| a.as_str()))
+                .filter_map(parse_hypr_address)
+                .find(|a| hypr_window_id(*a) == window_id)
+                .inspect(|&a| {
+                    self.remember(a);
+                })
+                .ok_or_else(|| anyhow::anyhow!("no Hyprland window with id {window_id:#x}"))?,
+        };
+        Ok(format!("address:0x{address:x}"))
     }
 }
 
@@ -592,43 +791,25 @@ impl WindowManager for HyprlandManager {
             if pid == 0 || !crate::eve_match::pid_is_eve_client(pid) {
                 continue;
             }
-            if let Some(address) = window.get("address").and_then(|a| a.as_str()) {
-                // Hyprland addresses are hex; lossy-narrow to u32 for
-                // the cross-platform EveWindow.id we use elsewhere.
-                let id = if let Some(hex) = address.strip_prefix("0x") {
-                    u32::from_str_radix(hex, 16).unwrap_or(0)
-                } else {
-                    0
-                };
-                eve_windows.push(EveWindow {
-                    id,
-                    title: title.trim_start_matches("EVE - ").to_string(),
-                });
-            }
+            let Some(address) = window
+                .get("address")
+                .and_then(|a| a.as_str())
+                .and_then(parse_hypr_address)
+            else {
+                continue;
+            };
+            eve_windows.push(EveWindow {
+                id: self.remember(address),
+                title: title.trim_start_matches("EVE - ").to_string(),
+            });
         }
 
         Ok(eve_windows)
     }
 
     fn activate_window(&self, window_id: u32) -> Result<()> {
-        // Convert u32 back to hex address
-        let address = format!("0x{:x}", window_id);
-
-        let output = Command::new("hyprctl")
-            .arg("dispatch")
-            .arg("focuswindow")
-            .arg(format!("address:{}", address))
-            .output()
-            .context("Failed to activate window")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Failed to activate window: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(())
+        self.dispatch(HyprDispatch::focus(&self.selector(window_id)?))
+            .context("Failed to activate window")
     }
 
     fn stack_windows(&self, windows: &[EveWindow], config: &Config) -> Result<()> {
@@ -638,80 +819,46 @@ impl WindowManager for HyprlandManager {
         let height = (config.display_height - config.panel_height) as i32;
 
         for window in windows {
-            let address = format!("0x{:x}", window.id);
-
-            // Enable floating
-            Command::new("hyprctl")
-                .arg("dispatch")
-                .arg("togglefloating")
-                .arg(format!("address:{}", address))
-                .output()?;
-
-            // Move window
-            Command::new("hyprctl")
-                .arg("dispatch")
-                .arg("movewindowpixel")
-                .arg(format!("exact {} {},address:{}", x, y, address))
-                .output()?;
-
-            // Resize window
-            Command::new("hyprctl")
-                .arg("dispatch")
-                .arg("resizewindowpixel")
-                .arg(format!("exact {} {},address:{}", width, height, address))
-                .output()?;
+            let sel = self.selector(window.id)?;
+            self.dispatch(HyprDispatch::float(&sel))?;
+            // Resize before moving: the Lua resize keeps the window's
+            // centre, which would shift an already-placed window.
+            self.dispatch(HyprDispatch::resize_to(&sel, width, height))?;
+            self.dispatch(HyprDispatch::move_to(&sel, x, y))?;
         }
 
         Ok(())
     }
 
     fn get_active_window(&self) -> Result<u32> {
-        let output = Command::new("hyprctl")
-            .arg("activewindow")
-            .arg("-j")
-            .output()
-            .context("Failed to get active window")?;
-
-        let window: Value =
-            serde_json::from_slice(&output.stdout).context("Failed to parse hyprctl output")?;
-
-        if let Some(address) = window.get("address").and_then(|a| a.as_str()) {
-            let id = if let Some(hex) = address.strip_prefix("0x") {
-                u32::from_str_radix(hex, 16).unwrap_or(0)
-            } else {
-                0
-            };
-            return Ok(id);
+        match self.active_address() {
+            Some(address) => Ok(self.remember(address)),
+            None => anyhow::bail!("Failed to get active window ID"),
         }
-
-        anyhow::bail!("Failed to get active window ID")
     }
 
     fn minimize_window(&self, window_id: u32) -> Result<()> {
-        let address = format!("0x{:x}", window_id);
-        Command::new("hyprctl")
-            .args([
-                "dispatch",
-                "movetoworkspacesilent",
-                &format!("special,address:{}", address),
-            ])
-            .output()
+        let sel = self.selector(window_id)?;
+        // The Lua workspace move focuses the moved window (there's no
+        // "silent" variant), which would undo the activation the cycle
+        // just did; hand focus back to whatever had it.
+        let previous = match self.syntax {
+            DispatchSyntax::Lua => self.active_address(),
+            DispatchSyntax::Legacy => None,
+        };
+        self.dispatch(HyprDispatch::to_special(&sel))
             .context("Failed to minimize window")?;
+        if let Some(prev) = previous.filter(|a| hypr_window_id(*a) != window_id) {
+            self.dispatch(HyprDispatch::focus(&format!("address:0x{prev:x}")))?;
+        }
         Ok(())
     }
 
     fn restore_window(&self, window_id: u32) -> Result<()> {
-        let address = format!("0x{:x}", window_id);
-        // Move back to current workspace
-        Command::new("hyprctl")
-            .args([
-                "dispatch",
-                "movetoworkspace",
-                &format!("e+0,address:{}", address),
-            ])
-            .output()
-            .context("Failed to restore window")?;
-        Ok(())
+        self.dispatch(HyprDispatch::to_current_workspace(
+            &self.selector(window_id)?,
+        ))
+        .context("Failed to restore window")
     }
 }
 
@@ -927,5 +1074,93 @@ impl WindowManager for GnomeManager {
     fn restore_window(&self, window_id: u32) -> Result<()> {
         // Activating an iconified window both un-minimizes and focuses it.
         self.activate_window(window_id)
+    }
+}
+
+#[cfg(test)]
+mod hyprland_tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_64_bit_address() {
+        // Real Hyprland addresses are heap pointers well above u32::MAX.
+        assert_eq!(parse_hypr_address("0x55eb4b6c12e0"), Some(0x55eb_4b6c_12e0));
+        assert_eq!(parse_hypr_address("55eb4b6c12e0"), Some(0x55eb_4b6c_12e0));
+        assert_eq!(parse_hypr_address("0xnothex"), None);
+    }
+
+    #[test]
+    fn dispatch_syntaxes() {
+        let sel = "address:0x55eb4b6c12e0";
+        let d = HyprDispatch::focus(sel);
+        assert_eq!(
+            d.args(DispatchSyntax::Legacy),
+            ["dispatch", "focuswindow", sel]
+        );
+        assert_eq!(
+            d.args(DispatchSyntax::Lua),
+            [
+                "dispatch",
+                r#"hl.dsp.focus({ window = "address:0x55eb4b6c12e0" })"#
+            ]
+        );
+        assert_eq!(
+            HyprDispatch::to_special(sel).args(DispatchSyntax::Legacy),
+            [
+                "dispatch",
+                "movetoworkspacesilent",
+                &format!("special,{sel}")
+            ]
+        );
+        // Every Lua dispatch names its window explicitly.
+        for d in [
+            HyprDispatch::float(sel),
+            HyprDispatch::move_to(sel, 1, 2),
+            HyprDispatch::resize_to(sel, 3, 4),
+            HyprDispatch::to_special(sel),
+            HyprDispatch::to_current_workspace(sel),
+        ] {
+            assert!(d.lua.starts_with("hl.dsp."), "{}", d.lua);
+            assert!(
+                d.lua.contains(r#"window = "address:0x55eb4b6c12e0""#),
+                "{}",
+                d.lua
+            );
+        }
+        assert_eq!(
+            HyprDispatch::move_to(sel, 6400, 0).lua,
+            r#"hl.dsp.window.move({ x = 6400, y = 0, window = "address:0x55eb4b6c12e0" })"#
+        );
+    }
+
+    #[test]
+    fn hyprctl_errors_on_stdout_are_failures() {
+        // Old-style dispatch on a Lua build: exit 7, error on stdout.
+        let lua_err = "Error: 3 [string \"return hl.dispatch(focuswindow...\"]:1: ')' expected";
+        assert!(hyprctl_failure(false, lua_err, "")
+            .unwrap()
+            .contains("expected"));
+        // Some failures exit 0.
+        assert!(hyprctl_failure(true, "warning: hl.focus: window not found", "").is_some());
+        assert!(hyprctl_failure(true, "Invalid dispatcher", "").is_some());
+        // Stale HYPRLAND_INSTANCE_SIGNATURE.
+        assert!(hyprctl_failure(
+            false,
+            "Couldn't connect to /run/user/1000/hypr/x/.socket.sock. (4)",
+            ""
+        )
+        .unwrap()
+        .contains("Couldn't connect"));
+        assert_eq!(hyprctl_failure(true, "ok\n", ""), None);
+        assert_eq!(
+            hyprctl_failure(false, "", "").as_deref(),
+            Some("hyprctl failed with no output")
+        );
+    }
+
+    #[test]
+    fn window_id_is_low_32_bits() {
+        assert_eq!(hypr_window_id(0x55eb_4b6c_12e0), 0x4b6c_12e0);
+        assert_ne!(hypr_window_id(0x55eb_4b6c_12e0), 0);
     }
 }
