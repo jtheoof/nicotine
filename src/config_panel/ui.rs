@@ -10,8 +10,8 @@ use iced::{Alignment, Background, Border, Color, Element, Font, Length, Shadow, 
 use crate::config::DisplayMode;
 
 use super::{
-    code_to_label, color, palette, CaptureTarget, Message, Panel, SliderField, Tab, CAPTION_SIZE,
-    LOGO_SIZE, MODIFIER_CHOICES, SECTION_SIZE,
+    code_to_label, color, palette, CaptureTarget, Message, OutputPick, Panel, SliderField, Tab,
+    CAPTION_SIZE, LOGO_SIZE, MODIFIER_CHOICES, SECTION_SIZE,
 };
 
 // Theme colours by role (see `crate::theme::PanelPalette`).
@@ -268,11 +268,18 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
             ),
         ]
         .spacing(16),
+    ]
+    .spacing(8);
+
+    if let Some(picker) = preview_output_picker(panel) {
+        col = col.push(picker);
+    }
+
+    col = col.push(
         checkbox(panel.config.positions_locked)
             .label("Lock positions (drag disabled on previews and list)")
             .on_toggle(Message::LockToggled),
-    ]
-    .spacing(8);
+    );
 
     // Hidden on GNOME Wayland, where the compositor blocks window
     // positioning so restacking can't do anything.
@@ -281,6 +288,46 @@ fn display_mode_section(panel: &Panel) -> Element<'_, Message> {
     }
 
     col.into()
+}
+
+/// "Preview monitor" picker: Auto or a specific monitor. Only shown when
+/// the preview manager publishes monitors (Wayland previews).
+fn preview_output_picker(panel: &Panel) -> Option<Element<'_, Message>> {
+    let outputs = panel.live.lock().unwrap().outputs.clone();
+    if outputs.is_empty() {
+        return None;
+    }
+    let mut options = vec![OutputPick::Auto];
+    options.extend(outputs.iter().map(|o| OutputPick::Output {
+        name: o.name.clone(),
+        label: o.label.clone(),
+    }));
+    let selected = match &panel.config.preview_output {
+        None => OutputPick::Auto,
+        Some(name) => options
+            .iter()
+            .find(|o| matches!(o, OutputPick::Output { name: n, .. } if n == name))
+            .cloned()
+            .unwrap_or_else(|| {
+                // Configured monitor isn't connected right now; keep it
+                // selectable so the setting isn't silently changed.
+                let missing = OutputPick::Output {
+                    name: name.clone(),
+                    label: format!("{name} (not connected)"),
+                };
+                options.push(missing.clone());
+                missing
+            }),
+    };
+    Some(
+        row![
+            text("Preview monitor"),
+            pick_list(options, Some(selected), Message::PreviewOutputChanged),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .into(),
+    )
 }
 
 fn characters_section(panel: &Panel) -> Element<'_, Message> {

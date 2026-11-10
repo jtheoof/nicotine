@@ -227,6 +227,7 @@ pub(super) struct Panel {
     /// Bounds the post-launch poll so it can't spin forever if the check
     /// never returns (e.g. offline).
     pub version_polls: u8,
+    pub outputs_polls: u32,
     /// In-progress text for each editable slider readout, keyed by field.
     /// Mirrors the value except while the user is typing, until they press
     /// Enter (commit) or drag the slider (re-sync).
@@ -287,6 +288,7 @@ impl Panel {
             dragging: None,
             drag_hover: None,
             version_polls: 0,
+            outputs_polls: 0,
         }
     }
 
@@ -363,9 +365,30 @@ impl Panel {
     }
 }
 
+/// Entry in the "Preview monitor" picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OutputPick {
+    /// Each preview on its EVE client's monitor.
+    Auto,
+    Output {
+        name: String,
+        label: String,
+    },
+}
+
+impl std::fmt::Display for OutputPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputPick::Auto => f.write_str("Auto (EVE client's monitor)"),
+            OutputPick::Output { label, .. } => f.write_str(label),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum Message {
     DisplayModeChanged(crate::config::DisplayMode),
+    PreviewOutputChanged(OutputPick),
     LockToggled(bool),
     RestackClicked,
     LogoClicked,
@@ -401,6 +424,7 @@ pub(super) enum Message {
     OpenLink(String),
     FlushIfIdle,
     VersionPoll,
+    OutputsPoll,
     WindowResized(u32, u32),
     CloseRequested,
 }
@@ -411,6 +435,20 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
             panel.config.display_mode = mode;
             panel.live.lock().unwrap().display_mode = mode;
             panel.touch();
+        }
+        Message::PreviewOutputChanged(pick) => {
+            let name = match pick {
+                OutputPick::Auto => None,
+                OutputPick::Output { name, .. } => Some(name),
+            };
+            panel.config.preview_output = name.clone();
+            panel.live.lock().unwrap().preview_output = name;
+            panel.touch();
+        }
+        Message::OutputsPoll => {
+            // Re-render so the monitor picker appears once the preview
+            // manager has published the outputs.
+            panel.outputs_polls = panel.outputs_polls.saturating_add(1);
         }
         Message::LockToggled(v) => {
             panel.config.positions_locked = v;
@@ -754,6 +792,11 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     }
     // Re-render a few times after launch so the async version-check result
     // appears once it lands (iced only redraws on events, unlike egui).
+    // Same for the monitor list the preview manager publishes shortly
+    // after startup (Wayland previews only; stays empty elsewhere).
+    if panel.outputs_polls < 20 && panel.live.lock().unwrap().outputs.is_empty() {
+        subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::OutputsPoll));
+    }
     if panel.version_polls < 20 && crate::version_check::get_update_status().is_none() {
         subs.push(iced::time::every(Duration::from_millis(700)).map(|_| Message::VersionPoll));
     }

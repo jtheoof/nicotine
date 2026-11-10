@@ -102,7 +102,7 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
 };
 
-use crate::config::{DisplayMode, LiveSettings};
+use crate::config::{DisplayMode, LiveSettings, OutputChoice};
 use crate::cycle_state::CycleState;
 use crate::preview_common::{
     preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
@@ -318,9 +318,6 @@ struct Preview {
     capture: Capture,
     drag: DragState,
     press_local: (f64, f64),
-    /// Where the drag wants the preview, before clamping to its output.
-    /// On release, a target centred on another output moves it there.
-    drag_target: (i32, i32),
     /// Pointer displacement since the press, in global logical pixels.
     drag_delta: (f64, f64),
     /// `drag_delta` changed since the preview was last moved; applied
@@ -429,10 +426,67 @@ fn confine_pointer(outputs: &[OutRect], prev: (f64, f64), next: (f64, f64)) -> (
     )
 }
 
-/// Output a dropped preview belongs on: the one under its centre, else
-/// `None` (dropped in a gap between outputs; stay where it is).
-fn drop_output(outputs: &[OutRect], x: i32, y: i32, w: i32, h: i32) -> Option<usize> {
-    output_index_at(outputs, x + w / 2, y + h / 2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragEnd {
+    /// Button released over the preview.
+    Release,
+    /// A drag whose release never reached us.
+    Stale,
+}
+
+/// New position for a preview at `pos` (on the monitor whose origin is
+/// `current_origin`) that belongs on `target`, or `None` if it's already
+/// there. Its offset within its monitor is kept (see `carry_to_output`).
+fn relocation(
+    target: OutRect,
+    current_origin: (i32, i32),
+    pos: (i32, i32),
+    outputs: &[OutRect],
+    size: (i32, i32),
+) -> Option<(i32, i32)> {
+    if current_origin == (target.x, target.y) {
+        return None;
+    }
+    Some(
+        carry_to_output(target, pos, outputs, size.0, size.1)
+            .unwrap_or_else(|| default_position(target, 0)),
+    )
+}
+
+/// Position for a `w`×`h` preview at `pos` moved onto `target`: kept if
+/// already there, else its offset within its own monitor is carried over
+/// (clamped). `None` if `pos` isn't on any monitor.
+fn carry_to_output(
+    target: OutRect,
+    pos: (i32, i32),
+    outputs: &[OutRect],
+    w: i32,
+    h: i32,
+) -> Option<(i32, i32)> {
+    if target.contains(pos.0, pos.1) {
+        return Some(target.clamp_box(pos.0, pos.1, w, h));
+    }
+    let from = outputs[output_index_at(outputs, pos.0, pos.1)?];
+    Some(target.clamp_box(
+        target.x + (pos.0 - from.x),
+        target.y + (pos.1 - from.y),
+        w,
+        h,
+    ))
+}
+
+/// Picker entry for a monitor: "DP-3 · LG ULTRAGEAR+ (3840×2160)".
+fn output_choice(name: &str, model: &str, size: (i32, i32)) -> OutputChoice {
+    let model = model.trim();
+    let label = if model.is_empty() || model.eq_ignore_ascii_case("unknown") {
+        format!("{name} ({}×{})", size.0, size.1)
+    } else {
+        format!("{name} · {model} ({}×{})", size.0, size.1)
+    };
+    OutputChoice {
+        name: name.to_string(),
+        label,
+    }
 }
 
 #[derive(Default)]
@@ -607,6 +661,7 @@ impl Manager {
         // (xdg-output info, toplevel done).
         queue.roundtrip(&mut manager).context("initial roundtrip")?;
         queue.roundtrip(&mut manager).context("second roundtrip")?;
+        manager.publish_outputs();
         println!(
             "Wayland preview manager started (layer-shell overlay + ext-image-copy-capture, {} buffers, {capture_fps} fps cap)",
             if manager.dmabuf_disabled { "shm" } else { "dmabuf" }
@@ -681,6 +736,7 @@ impl Manager {
                 l.preview_opacity,
             )
         };
+        self.relocate_previews();
         if mode == DisplayMode::List && !self.warned_list_mode {
             eprintln!("List display mode isn't implemented on the Wayland preview backend yet");
             self.warned_list_mode = true;
@@ -783,6 +839,82 @@ impl Manager {
             .collect()
     }
 
+    /// The monitor chosen in the panel ("Preview monitor"), if it's set and
+    /// connected. `None` = auto placement.
+    fn fixed_output(&self) -> Option<OutRect> {
+        let name = self.live.lock_recover().preview_output.clone()?;
+        self.output_state.outputs().find_map(|o| {
+            let info = self.output_state.info(&o)?;
+            if info.name.as_deref() != Some(name.as_str()) {
+                return None;
+            }
+            let (pos, size) = (info.logical_position?, info.logical_size?);
+            Some(OutRect {
+                x: pos.0,
+                y: pos.1,
+                w: size.0,
+                h: size.1,
+            })
+        })
+    }
+
+    /// Share the connected monitors with the config panel's picker.
+    fn publish_outputs(&self) {
+        let mut outputs: Vec<(i32, i32, OutputChoice)> = self
+            .output_state
+            .outputs()
+            .filter_map(|o| {
+                let info = self.output_state.info(&o)?;
+                let name = info.name.clone()?;
+                let (pos, size) = (info.logical_position?, info.logical_size?);
+                Some((pos.0, pos.1, output_choice(&name, &info.model, size)))
+            })
+            .collect();
+        // Left-to-right, top-to-bottom, like the physical layout.
+        outputs.sort_by_key(|(x, y, _)| (*x, *y));
+        self.live.lock_recover().outputs = outputs.into_iter().map(|(_, _, c)| c).collect();
+    }
+
+    /// Monitor preview `name` belongs on: the "Preview monitor" choice,
+    /// or with Auto the monitor its EVE client is on. `None` while that
+    /// isn't known yet (the preview then stays put).
+    fn target_output(&self, name: &str) -> Option<OutRect> {
+        self.fixed_output().or_else(|| self.eve_output(name))
+    }
+
+    /// Move every preview that isn't on its target monitor there, keeping
+    /// its offset within its monitor, persist the new positions, and
+    /// rebuild those previews (a layer surface's output is fixed at
+    /// creation). Runs each reconcile, so it follows a changed "Preview
+    /// monitor" choice and, in Auto, an EVE client moved to another
+    /// monitor.
+    fn relocate_previews(&mut self) {
+        let rects: Vec<OutRect> = self.output_rects().into_iter().map(|(_, r)| r).collect();
+        let moves: Vec<(u64, String, (i32, i32))> = self
+            .previews
+            .values()
+            // Never yank a preview out from under an active drag.
+            .filter(|p| !p.drag.active)
+            .filter_map(|p| {
+                let target = self.target_output(&p.name)?;
+                let size = (p.width as i32, p.height as i32);
+                relocation(target, p.output_origin, (p.x, p.y), &rects, size)
+                    .map(|pos| (p.id, p.name.clone(), pos))
+            })
+            .collect();
+        if moves.is_empty() {
+            return;
+        }
+        let mut positions = self.positions.lock_recover();
+        for (id, name, (x, y)) in moves {
+            positions.set(name, x, y);
+            self.previews.remove(&id);
+        }
+        positions.save();
+        drop(positions);
+        self.needs_reconcile = true;
+    }
+
     /// Output containing (x, y), else the first known output.
     fn pick_output(&self, x: i32, y: i32) -> Option<OutputGeometry> {
         let outputs = self.output_rects();
@@ -816,14 +948,29 @@ impl Manager {
     ) -> Result<()> {
         let saved = self.positions.lock_recover().get(name);
         let rects: Vec<OutRect> = self.output_rects().into_iter().map(|(_, r)| r).collect();
-        let (x, y) = match saved.filter(|(x, y)| output_index_at(&rects, *x, *y).is_some()) {
+        let (pw, ph) = (width as i32, height as i32);
+        let placed = match self.target_output(name) {
+            // On its target monitor: keep the saved spot if it's there,
+            // else carry its offset over from whatever monitor it was on.
+            Some(t) => Some(
+                saved
+                    .and_then(|pos| carry_to_output(t, pos, &rects, pw, ph))
+                    .unwrap_or_else(|| {
+                        let off = self.next_offset;
+                        self.next_offset = (self.next_offset + 32) % 320;
+                        default_position(t, off)
+                    }),
+            ),
+            None => saved.filter(|(x, y)| output_index_at(&rects, *x, *y).is_some()),
+        };
+        let (x, y) = match placed {
             Some(p) => p,
             None => {
-                // Start on the EVE client's own monitor; fall back to the
-                // first output (no output need contain the origin).
-                let base = self
-                    .eve_output(name)
-                    .or_else(|| rects.first().copied())
+                // Target monitor unknown yet: the first output (no output
+                // need contain the origin). Relocated once it's known.
+                let base = rects
+                    .first()
+                    .copied()
                     .ok_or_else(|| anyhow::anyhow!("no outputs with known geometry"))?;
                 let off = self.next_offset;
                 self.next_offset = (self.next_offset + 32) % 320;
@@ -921,7 +1068,6 @@ impl Manager {
             },
             drag: DragState::default(),
             press_local: (0.0, 0.0),
-            drag_target: (x, y),
             drag_delta: (0.0, 0.0),
             pending_move: false,
         };
@@ -1338,10 +1484,9 @@ impl Manager {
                 &others,
                 SNAP_THRESHOLD_PX,
             );
-            // A layer surface can't straddle outputs, so the visible
-            // preview stays clamped to its current one; the unclamped
-            // target decides on release whether it moves to another.
-            p.drag_target = (sx, sy);
+            // A layer surface can't straddle outputs, and which monitor a
+            // preview is on is decided by the "Preview monitor" setting,
+            // so drags stay within the current one.
             let current = OutRect {
                 x: p.output_origin.0,
                 y: p.output_origin.1,
@@ -1355,6 +1500,31 @@ impl Manager {
                 p.layer.commit();
             }
         }
+    }
+
+    /// End a press/drag on preview `id`: a press without a drag is a
+    /// click (activate its EVE client, unless the release was lost), a
+    /// drag saves the new position.
+    fn finish_drag(&mut self, id: u64, end: DragEnd) {
+        self.apply_drag_moves();
+        let Some(p) = self.previews.get_mut(&id) else {
+            return;
+        };
+        if !p.drag.active {
+            return;
+        }
+        let dragged = p.drag.dragged;
+        p.drag = DragState::default();
+        let (name, x, y) = (p.name.clone(), p.x, p.y);
+        if !dragged {
+            if end == DragEnd::Release {
+                self.activate(&name);
+            }
+            return;
+        }
+        let mut positions = self.positions.lock_recover();
+        positions.set(name, x, y);
+        positions.save();
     }
 
     fn handle_pointer(&mut self, event: &PointerEvent) {
@@ -1397,38 +1567,21 @@ impl Manager {
                 p.pending_move = true;
             }
             PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                self.apply_drag_moves();
-                let Some(p) = self.previews.get_mut(&id) else {
-                    return;
-                };
-                if !p.drag.active {
-                    return;
-                }
-                let dragged = p.drag.dragged;
-                p.drag = DragState::default();
-                let (name, mut x, mut y) = (p.name.clone(), p.x, p.y);
-                let (tx, ty) = p.drag_target;
-                let (w, h) = (p.width as i32, p.height as i32);
-                let current = p.output_origin;
-                if dragged {
-                    // Dropped onto another monitor: save the position
-                    // there and rebuild the preview on that output (a
-                    // layer surface's output is fixed at creation).
-                    let rects: Vec<OutRect> =
-                        self.output_rects().into_iter().map(|(_, r)| r).collect();
-                    let moved = drop_output(&rects, tx, ty, w, h)
-                        .map(|i| rects[i])
-                        .filter(|r| (r.x, r.y) != current);
-                    if let Some(target) = moved {
-                        (x, y) = target.clamp_box(tx, ty, w, h);
-                        self.previews.remove(&id);
-                        self.needs_reconcile = true;
-                    }
-                    let mut positions = self.positions.lock_recover();
-                    positions.set(name, x, y);
-                    positions.save();
-                } else {
-                    self.activate(&name);
+                self.finish_drag(id, DragEnd::Release);
+            }
+            // Hyprland may stop sending a layer surface pointer events once
+            // the cursor leaves it mid-drag, so the release can go to
+            // another surface. Entering any preview while a drag is still
+            // marked active means that happened: settle it.
+            PointerEventKind::Enter { .. } => {
+                let stale: Vec<u64> = self
+                    .previews
+                    .values()
+                    .filter(|p| p.drag.active)
+                    .map(|p| p.id)
+                    .collect();
+                for id in stale {
+                    self.finish_drag(id, DragEnd::Stale);
                 }
             }
             _ => {}
@@ -1616,9 +1769,15 @@ impl OutputHandler for Manager {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {
+        self.publish_outputs();
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {
+        self.publish_outputs();
+    }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {
+        self.publish_outputs();
+    }
 }
 
 impl LayerShellHandler for Manager {
@@ -2111,17 +2270,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_picks_output_under_preview_centre() {
-        let outs = [DP1, DP3, DP2];
-        // Mostly on DP-1, centre still on DP-1.
-        assert_eq!(drop_output(&outs, 5800, 300, 480, 270), Some(0));
-        // Straddling with centre past x = 6400 → DP-3.
-        assert_eq!(drop_output(&outs, 6200, 300, 480, 270), Some(1));
-        // Centre above DP-3's top (y < 234) and right of DP-1: a gap.
-        assert_eq!(drop_output(&outs, 7000, -200, 480, 270), None);
-    }
-
-    #[test]
     fn dmabuf_format_prefers_xrgb_then_argb() {
         let offered = vec![
             (DRM_FORMAT_ARGB8888, vec![1, 2]),
@@ -2183,6 +2331,68 @@ mod tests {
     }
 
     #[test]
+    fn relocation_moves_previews_onto_their_target_monitor() {
+        let outs = [DP1, DP3, DP2];
+        let size = (207, 131);
+        // Saved on DP-1 while EVE is on DP-3 (Auto): moved, offset kept.
+        assert_eq!(
+            relocation(DP3, (DP1.x, DP1.y), (DP1.x + 600, DP1.y + 40), &outs, size),
+            Some((DP3.x + 600, DP3.y + 40))
+        );
+        // Already on the target: stays.
+        assert_eq!(
+            relocation(DP3, (DP3.x, DP3.y), (7000, 500), &outs, size),
+            None
+        );
+        // Position off every monitor: default spot on the target.
+        assert_eq!(
+            relocation(DP3, (DP1.x, DP1.y), (0, 0), &outs, size),
+            Some(default_position(DP3, 0))
+        );
+    }
+
+    #[test]
+    fn carry_keeps_offset_within_monitor() {
+        let outs = [DP1, DP3, DP2];
+        // 100,50 into DP-1 → 100,50 into DP-3.
+        assert_eq!(
+            carry_to_output(DP3, (DP1.x + 100, DP1.y + 50), &outs, 207, 131),
+            Some((DP3.x + 100, DP3.y + 50))
+        );
+        // Already on the target: unchanged.
+        assert_eq!(
+            carry_to_output(DP3, (7000, 500), &outs, 207, 131),
+            Some((7000, 500))
+        );
+        // An offset past the narrower (portrait) DP-1 is clamped on x;
+        // y = 2100 still fits its 2560 px height.
+        assert_eq!(
+            carry_to_output(DP1, (DP3.x + 3800, DP3.y + 2100), &outs, 207, 131),
+            Some((DP1.x + DP1.w - 207, DP1.y + 2100))
+        );
+        // From the taller DP-1 to DP-3, a low offset is clamped on y.
+        assert_eq!(
+            carry_to_output(DP3, (DP1.x + 100, DP1.y + 2500), &outs, 207, 131),
+            Some((DP3.x + 100, DP3.y + DP3.h - 131))
+        );
+        // Not on any monitor.
+        assert_eq!(carry_to_output(DP3, (0, 0), &outs, 207, 131), None);
+    }
+
+    #[test]
+    fn output_choice_labels() {
+        assert_eq!(
+            output_choice("DP-3", "LG ULTRAGEAR+", (3840, 2160)).label,
+            "DP-3 · LG ULTRAGEAR+ (3840×2160)"
+        );
+        assert_eq!(
+            output_choice("HDMI-A-1", "", (1920, 1080)).label,
+            "HDMI-A-1 (1920×1080)"
+        );
+        assert_eq!(output_choice("DP-1", "x", (1, 1)).name, "DP-1");
+    }
+
+    #[test]
     fn clamp_box_keeps_preview_inside_output() {
         assert_eq!(DP3.clamp_box(6200, 300, 480, 270), (6400, 300));
         assert_eq!(
@@ -2233,6 +2443,8 @@ mod tests {
             positions_locked: true,
             show_previews: true,
             hide_active_preview: false,
+            preview_output: None,
+            outputs: Vec::new(),
         }));
         let font = FontSettings {
             font: std::env::var("NICOTINE_TEST_FONT").ok(),

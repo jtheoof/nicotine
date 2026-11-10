@@ -54,6 +54,24 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Monitor (connector name, e.g. "DP-1") previews are placed on;
+    /// `None` = auto (each preview follows its EVE client's monitor).
+    /// Applied live by the Wayland preview manager.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub preview_output: Option<String>,
+    /// Monitors previews can be placed on, published by the Wayland
+    /// preview manager for the panel's picker. Empty where per-monitor
+    /// placement isn't supported (the panel hides the picker).
+    pub outputs: Vec<OutputChoice>,
+}
+
+/// A monitor the preview manager can place previews on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChoice {
+    /// Connector name, stored in config (`preview_output`).
+    pub name: String,
+    /// Human-readable label for the picker, e.g. "DP-3 · LG ULTRAGEAR+".
+    pub label: String,
 }
 
 impl LiveSettings {
@@ -66,6 +84,8 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            preview_output: config.preview_output.clone(),
+            outputs: Vec::new(),
         }))
     }
 }
@@ -190,6 +210,11 @@ pub struct Config {
     /// Per-colour preview-chrome overrides on top of `theme`, as "#RRGGBB".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_colors: Option<PreviewColors>,
+    /// Monitor previews are placed on, by connector name (e.g. "DP-1").
+    /// Unset = auto: each preview stays on its EVE client's monitor and
+    /// follows it if the client moves. Linux Wayland previews only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_output: Option<String>,
 }
 
 /// `[preview_colors]` table: optional "#RRGGBB" overrides for the preview
@@ -453,6 +478,7 @@ impl Config {
             preview_font_antialias: None,
             theme: None,
             preview_colors: None,
+            preview_output: None,
         }
     }
 
@@ -517,6 +543,7 @@ mod tests {
             preview_font_antialias: None,
             theme: None,
             preview_colors: None,
+            preview_output: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -561,6 +588,7 @@ mod tests {
             preview_font_antialias: None,
             theme: None,
             preview_colors: None,
+            preview_output: None,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -604,6 +632,7 @@ mod tests {
             preview_font_antialias: None,
             theme: None,
             preview_colors: None,
+            preview_output: None,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,
