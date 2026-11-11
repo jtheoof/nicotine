@@ -8,13 +8,13 @@ use crate::cycle_state::CycleState;
 use crate::input_actions::{fetch_bounded, ActionQueue, InputAction};
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use evdev::{Device, EventType, KeyCode};
+use evdev::{Device, EventType, InputEvent, KeyCode};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyboardConfig {
@@ -54,6 +54,38 @@ impl KeyboardConfig {
 }
 
 const POLL_TIMEOUT_MS: u16 = 200;
+/// How often autodetect mode looks for keyboards that appeared since the
+/// last scan (a wireless keyboard waking up, a hotplugged one).
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// The same key event arriving from two device nodes within this window
+/// is one physical press reported twice (some receivers expose a keyboard
+/// on more than one interface); act on it once. Far below key-repeat
+/// intervals, so repeats are never swallowed.
+const ECHO_WINDOW: Duration = Duration::from_millis(15);
+
+/// Last key event acted on, for [`is_echo`].
+#[derive(Debug, Clone, Copy)]
+struct KeyStamp {
+    code: u16,
+    value: i32,
+    device: usize,
+    at: Instant,
+}
+
+/// Is this key event a duplicate of `prev` delivered by another device?
+fn is_echo(prev: Option<&KeyStamp>, code: u16, value: i32, device: usize, now: Instant) -> bool {
+    prev.is_some_and(|p| {
+        p.code == code
+            && p.value == value
+            && p.device != device
+            && now.saturating_duration_since(p.at) < ECHO_WINDOW
+    })
+}
+
+/// `N` of an `eventN` device node name.
+fn event_number(name: &str) -> Option<u32> {
+    name.strip_prefix("event")?.parse().ok()
+}
 
 pub struct KeyboardListener;
 
@@ -76,7 +108,14 @@ impl KeyboardListener {
         // Cycling/switching runs on a worker so a slow window-manager
         // round-trip never stalls reading (see `input_actions`).
         let actions = ActionQueue::spawn("keyboard", wm, state);
-        let mut device: Option<Device> = None;
+        // Every keyboard-capable event node we listen on. Gaming mice and
+        // USB receivers expose keyboard interfaces too (for macros), so
+        // "the first device with a Tab key" was often a mouse and the real
+        // keyboard was never read. Listening on all of them catches the
+        // real keyboard, a second one, and remappers' virtual keyboards.
+        // Mouse nodes deliver 1 kHz motion here too; that's fine now that
+        // reading never blocks on cycling and fetches are bounded.
+        let mut devices: Vec<(PathBuf, Device)> = Vec::new();
         let mut current_dev_path: Option<String> = None;
         // Modifier-down state. Reset on (re)connect because the kernel
         // doesn't replay release events for keys held during a device
@@ -84,6 +123,8 @@ impl KeyboardListener {
         let mut pressed_modifiers: HashSet<u16> = HashSet::new();
         let mut announced_listening = false;
         let mut announced_idle = false;
+        let mut last_scan = Instant::now();
+        let mut last_key: Option<KeyStamp> = None;
 
         loop {
             let snap = shared.lock().unwrap().clone();
@@ -101,44 +142,57 @@ impl KeyboardListener {
                     announced_idle = true;
                     announced_listening = false;
                 }
-                device = None;
+                devices.clear();
                 current_dev_path = None;
                 pressed_modifiers.clear();
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
 
-            if device.is_none() || current_dev_path != snap.keyboard_device_path {
-                // Drop the old device first — see the matching note in
-                // mouse_listener: a `device = match { Err => continue }`
-                // doesn't assign on the Err path, which would otherwise
-                // leave us using the stale device after a failed
-                // device-path change.
-                device = None;
+            if devices.is_empty() || current_dev_path != snap.keyboard_device_path {
+                devices.clear();
                 current_dev_path = snap.keyboard_device_path.clone();
                 pressed_modifiers.clear();
-                match Self::find_keyboard_device(snap.keyboard_device_path.as_deref()) {
-                    Ok(d) => {
+                match Self::find_keyboard_devices(snap.keyboard_device_path.as_deref(), &[]) {
+                    Ok(found) if !found.is_empty() => {
                         announced_idle = false;
                         announced_listening = false;
-                        device = Some(d);
+                        devices = found;
+                        last_scan = Instant::now();
                     }
-                    Err(e) => {
+                    Ok(_) => {
                         eprintln!(
-                            "Keyboard device not available ({}); retrying in 2s. \
-                             Check permissions on /dev/input/event* and whether \
-                             your user is in the `input` group.",
-                            e
+                            "No keyboard devices found; retrying in 2s. Check permissions \
+                             on /dev/input/event* and whether your user is in the `input` group."
                         );
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
+                    }
+                    Err(e) => {
+                        eprintln!("Keyboard device scan failed ({}); retrying in 2s.", e);
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                }
+            } else if snap.keyboard_device_path.is_none() && last_scan.elapsed() >= RESCAN_INTERVAL
+            {
+                // Autodetect: add keyboards that appeared since the last
+                // scan (wireless wake-up, hotplug).
+                last_scan = Instant::now();
+                let known: Vec<PathBuf> = devices.iter().map(|(p, _)| p.clone()).collect();
+                if let Ok(new) = Self::find_keyboard_devices(None, &known) {
+                    if !new.is_empty() {
+                        devices.extend(new);
+                        announced_listening = false;
                     }
                 }
             }
 
             if !announced_listening {
                 println!(
-                    "Listening for keyboard keys: forward={} backward={} (+{} character hotkey(s))",
+                    "Listening on {} keyboard device(s) for keys: forward={} backward={} \
+                     (+{} character hotkey(s))",
+                    devices.len(),
                     snap.forward_key,
                     snap.backward_key,
                     snap.character_hotkeys.len()
@@ -161,117 +215,161 @@ impl KeyboardListener {
             // "stuck" in the pressed set.
             pressed_modifiers.retain(|c| modifier_codes.contains(c));
 
-            // Scoped so the shared borrow of `device` ends before the
-            // mutable one fetch_events needs.
-            let polled = {
-                let fd = device.as_ref().expect("device set above").as_fd();
-                let mut pollfds = [PollFd::new(fd, PollFlags::POLLIN)];
-                poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS))
-                    .map(|n| (n, pollfds[0].revents().unwrap_or_else(PollFlags::empty)))
-            };
-            let (n, revents) = match polled {
-                Ok(v) => v,
+            // `pollfds` borrows `devices`; it's dropped before any device
+            // is read or removed.
+            let mut pollfds: Vec<PollFd> = devices
+                .iter()
+                .map(|(_, d)| PollFd::new(d.as_fd(), PollFlags::POLLIN))
+                .collect();
+            let n = match poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS)) {
+                Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Keyboard poll failed ({}); reconnecting.", e);
-                    device = None;
+                    eprintln!("Keyboard poll failed ({}); rescanning.", e);
+                    devices.clear();
                     continue;
                 }
             };
             if n == 0 {
                 continue;
             }
-            if !revents.contains(PollFlags::POLLIN) {
-                eprintln!("Keyboard device hung up; reconnecting.");
-                device = None;
-                continue;
+            let mut ready: Vec<usize> = Vec::new();
+            let mut dead: Vec<usize> = Vec::new();
+            for (i, pfd) in pollfds.iter().enumerate() {
+                let revents = pfd.revents().unwrap_or_else(PollFlags::empty);
+                if revents.contains(PollFlags::POLLIN) {
+                    ready.push(i);
+                } else if revents
+                    .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                {
+                    // POLLNVAL too: an fd poll reports but that isn't
+                    // readable would otherwise spin this loop.
+                    dead.push(i);
+                }
             }
-            let events = match fetch_bounded(device.as_mut().unwrap()) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Keyboard device read failed ({}); reconnecting.", e);
-                    device = None;
-                    continue;
-                }
-            };
-            for event in events {
-                if event.event_type() != EventType::KEY {
-                    continue;
-                }
-                let code = event.code();
+            drop(pollfds);
 
-                // Track press/release of modifier-eligible keys.
-                if modifier_codes.contains(&code) {
-                    if event.value() != 0 {
-                        pressed_modifiers.insert(code);
-                    } else {
-                        pressed_modifiers.remove(&code);
-                    }
+            let mut batches: Vec<(usize, Vec<InputEvent>)> = Vec::new();
+            for &i in &ready {
+                match fetch_bounded(&mut devices[i].1) {
+                    Ok(events) => batches.push((i, events)),
+                    Err(_) => dead.push(i),
                 }
-
-                // Only act on press / repeat.
-                if event.value() == 0 {
-                    continue;
+            }
+            if !dead.is_empty() {
+                dead.sort_unstable();
+                dead.dedup();
+                for &i in dead.iter().rev() {
+                    let (path, device) = devices.remove(i);
+                    eprintln!(
+                        "Keyboard device '{}' ({}) went away; dropping.",
+                        device.name().unwrap_or("Unknown"),
+                        path.display()
+                    );
                 }
+                // A key held on the vanished device never sends its
+                // release.
+                pressed_modifiers.clear();
+                announced_listening = false;
+            }
 
-                // Preview-visibility toggle. Independent of cycling enable,
-                // and acts only on the initial press (value == 1) so a held
-                // key doesn't strobe show/hide on key-repeat. Consume the
-                // key either way so it can't also trigger cycling/switching.
-                if toggle_previews_should_fire(
-                    snap.toggle_previews_key,
-                    snap.toggle_previews_modifier,
-                    code,
-                    &pressed_modifiers,
-                ) {
-                    if event.value() == 1 {
-                        let mut live = live.lock().unwrap();
-                        live.show_previews = !live.show_previews;
-                        println!(
-                            "Preview windows toggled {} via hotkey",
-                            if live.show_previews { "on" } else { "off" }
-                        );
-                    }
-                    continue;
-                }
-
-                // Modifier+backward must be checked first so the
-                // same-key (Tab + Shift+Tab) pattern works. Skip the
-                // whole cycling block when the user has cycling
-                // disabled but kept the listener alive for character
-                // hotkeys — otherwise Tab would still cycle.
-                if snap.enable {
-                    let main_modifier_held = snap
-                        .modifier_key
-                        .map(|m| pressed_modifiers.contains(&m))
-                        .unwrap_or(false);
-                    let minimize_inactive = snap.minimize_inactive;
-                    if code == snap.backward_key && main_modifier_held {
-                        actions.push(InputAction::Backward { minimize_inactive });
+            for (device_idx, events) in batches {
+                for event in events {
+                    if event.event_type() != EventType::KEY {
                         continue;
                     }
-                    if code == snap.forward_key {
-                        actions.push(InputAction::Forward { minimize_inactive });
+                    let code = event.code();
+                    let now = Instant::now();
+                    if is_echo(last_key.as_ref(), code, event.value(), device_idx, now) {
                         continue;
                     }
-                    if code == snap.backward_key {
-                        actions.push(InputAction::Backward { minimize_inactive });
-                        continue;
-                    }
-                }
-
-                let target =
-                    resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
-                if let Some(name) = target {
-                    actions.push(InputAction::SwitchTo {
-                        name,
-                        minimize_inactive: snap.minimize_inactive,
+                    last_key = Some(KeyStamp {
+                        code,
+                        value: event.value(),
+                        device: device_idx,
+                        at: now,
                     });
+
+                    // Track press/release of modifier-eligible keys.
+                    if modifier_codes.contains(&code) {
+                        if event.value() != 0 {
+                            pressed_modifiers.insert(code);
+                        } else {
+                            pressed_modifiers.remove(&code);
+                        }
+                    }
+
+                    // Only act on press / repeat.
+                    if event.value() == 0 {
+                        continue;
+                    }
+
+                    // Preview-visibility toggle. Independent of cycling enable,
+                    // and acts only on the initial press (value == 1) so a held
+                    // key doesn't strobe show/hide on key-repeat. Consume the
+                    // key either way so it can't also trigger cycling/switching.
+                    if toggle_previews_should_fire(
+                        snap.toggle_previews_key,
+                        snap.toggle_previews_modifier,
+                        code,
+                        &pressed_modifiers,
+                    ) {
+                        if event.value() == 1 {
+                            let mut live = live.lock().unwrap();
+                            live.show_previews = !live.show_previews;
+                            println!(
+                                "Preview windows toggled {} via hotkey",
+                                if live.show_previews { "on" } else { "off" }
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Modifier+backward must be checked first so the
+                    // same-key (Tab + Shift+Tab) pattern works. Skip the
+                    // whole cycling block when the user has cycling
+                    // disabled but kept the listener alive for character
+                    // hotkeys — otherwise Tab would still cycle.
+                    if snap.enable {
+                        let main_modifier_held = snap
+                            .modifier_key
+                            .map(|m| pressed_modifiers.contains(&m))
+                            .unwrap_or(false);
+                        let minimize_inactive = snap.minimize_inactive;
+                        if code == snap.backward_key && main_modifier_held {
+                            actions.push(InputAction::Backward { minimize_inactive });
+                            continue;
+                        }
+                        if code == snap.forward_key {
+                            actions.push(InputAction::Forward { minimize_inactive });
+                            continue;
+                        }
+                        if code == snap.backward_key {
+                            actions.push(InputAction::Backward { minimize_inactive });
+                            continue;
+                        }
+                    }
+
+                    let target =
+                        resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
+                    if let Some(name) = target {
+                        actions.push(InputAction::SwitchTo {
+                            name,
+                            minimize_inactive: snap.minimize_inactive,
+                        });
+                    }
                 }
             }
         }
     }
 
-    fn find_keyboard_device(configured_path: Option<&str>) -> Result<Device> {
+    /// Open the keyboard device(s) to listen on: the configured
+    /// `keyboard_device_path` alone if set and openable, otherwise every
+    /// event node advertising keyboard keys, in event-number order,
+    /// skipping paths in `skip` (already open).
+    fn find_keyboard_devices(
+        configured_path: Option<&str>,
+        skip: &[PathBuf],
+    ) -> Result<Vec<(PathBuf, Device)>> {
         if let Some(path_str) = configured_path {
             let path = Path::new(path_str);
             match Device::open(path) {
@@ -281,7 +379,7 @@ impl KeyboardListener {
                         device.name().unwrap_or("Unknown"),
                         path.display()
                     );
-                    return Ok(device);
+                    return Ok(vec![(path.to_path_buf(), device)]);
                 }
                 Err(e) => {
                     eprintln!(
@@ -293,36 +391,39 @@ impl KeyboardListener {
             }
         }
 
-        let devices_path = Path::new("/dev/input");
-        let mut event_paths: Vec<_> = std::fs::read_dir(devices_path)?
+        let mut event_paths: Vec<(u32, PathBuf)> = std::fs::read_dir("/dev/input")?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|s| s.starts_with("event"))
+            .filter_map(|p| {
+                let n = event_number(p.file_name()?.to_str()?)?;
+                Some((n, p))
             })
             .collect();
+        // Numeric, so event7 comes before event11.
         event_paths.sort();
 
-        for path in event_paths {
-            if let Ok(device) = Device::open(&path) {
-                if device.supported_keys().is_some_and(|keys| {
-                    keys.contains(KeyCode::KEY_TAB)
-                        || keys.contains(KeyCode::KEY_LEFTSHIFT)
-                        || keys.contains(KeyCode::KEY_Z)
-                }) {
-                    println!(
-                        "Found keyboard device: {} ({})",
-                        device.name().unwrap_or("Unknown"),
-                        path.display()
-                    );
-                    return Ok(device);
-                }
+        let mut found = Vec::new();
+        for (_, path) in event_paths {
+            if skip.contains(&path) {
+                continue;
+            }
+            let Ok(device) = Device::open(&path) else {
+                continue;
+            };
+            if device.supported_keys().is_some_and(|keys| {
+                keys.contains(KeyCode::KEY_TAB)
+                    || keys.contains(KeyCode::KEY_LEFTSHIFT)
+                    || keys.contains(KeyCode::KEY_Z)
+            }) {
+                println!(
+                    "Found keyboard device: {} ({})",
+                    device.name().unwrap_or("Unknown"),
+                    path.display()
+                );
+                found.push((path, device));
             }
         }
-
-        anyhow::bail!("No keyboard device found in /dev/input")
+        Ok(found)
     }
 }
 
@@ -587,5 +688,70 @@ mod tests {
             88,
             &HashSet::new()
         ));
+    }
+
+    #[test]
+    fn event_numbers_sort_numerically() {
+        let mut names = vec![
+            "event11", "event7", "event12", "event0", "mouse2", "event100",
+        ];
+        names.retain(|n| event_number(n).is_some());
+        names.sort_by_key(|n| event_number(n));
+        assert_eq!(
+            names,
+            ["event0", "event7", "event11", "event12", "event100"]
+        );
+        assert_eq!(event_number("eventX"), None);
+    }
+
+    #[test]
+    fn echo_from_another_device_is_dropped_once() {
+        let t0 = Instant::now();
+        let prev = KeyStamp {
+            code: 27,
+            value: 1,
+            device: 0,
+            at: t0,
+        };
+        // Same press from another node right away: echo.
+        assert!(is_echo(
+            Some(&prev),
+            27,
+            1,
+            1,
+            t0 + Duration::from_millis(2)
+        ));
+        // Same device (e.g. auto-repeat) is never an echo.
+        assert!(!is_echo(
+            Some(&prev),
+            27,
+            1,
+            0,
+            t0 + Duration::from_millis(2)
+        ));
+        // Different key, or release vs press: not an echo.
+        assert!(!is_echo(
+            Some(&prev),
+            26,
+            1,
+            1,
+            t0 + Duration::from_millis(2)
+        ));
+        assert!(!is_echo(
+            Some(&prev),
+            27,
+            0,
+            1,
+            t0 + Duration::from_millis(2)
+        ));
+        // Outside the window: a genuine second press.
+        assert!(!is_echo(
+            Some(&prev),
+            27,
+            1,
+            1,
+            t0 + Duration::from_millis(40)
+        ));
+        assert!(!is_echo(None, 27, 1, 1, t0));
     }
 }
