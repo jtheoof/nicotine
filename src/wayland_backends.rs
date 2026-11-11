@@ -641,6 +641,29 @@ impl HyprDispatch {
     }
 }
 
+/// Lua chunk for `hyprctl eval` that focuses `sel` without Hyprland
+/// warping the cursor to the window's centre: `cursor.no_warps` is forced
+/// on for the one dispatch and then restored to the user's value (also
+/// when the dispatch fails, via pcall). The user's own keybinds keep
+/// their normal warping.
+fn no_warp_focus_lua(sel: &str) -> String {
+    format!(
+        r#"local prev = hl.get_config("cursor.no_warps")
+hl.config({{ cursor = {{ no_warps = true }} }})
+local ok, err = pcall(hl.dispatch, hl.dsp.focus({{ window = "{sel}" }}))
+hl.config({{ cursor = {{ no_warps = prev }} }})
+if not ok then error(err) end"#
+    )
+}
+
+/// `hyprctl --batch` equivalent of [`no_warp_focus_lua`] for pre-Lua
+/// Hyprland; `restore` is the user's `cursor:no_warps` value.
+fn no_warp_focus_batch(sel: &str, restore: bool) -> String {
+    format!(
+        "keyword cursor:no_warps true ; dispatch focuswindow {sel} ; keyword cursor:no_warps {restore}"
+    )
+}
+
 /// Did a `hyprctl` command fail? hyprctl prints errors (bad dispatch
 /// syntax, unknown window, unreachable socket) on stdout, sometimes with
 /// a zero exit status, so both are checked. Returns the message to report.
@@ -718,6 +741,31 @@ impl HyprlandManager {
 
     fn dispatch(&self, d: HyprDispatch) -> Result<()> {
         run_hyprctl(&d.args(self.syntax)).map(|_| ())
+    }
+
+    /// Focus `sel` (an `address:0x…` selector) without moving the
+    /// cursor. Hyprland warps the cursor to the centre of a window focused
+    /// by a dispatcher unless `cursor:no_warps` is set; with fullscreen
+    /// clients stacked on one monitor that dumps the cursor in the middle
+    /// of the screen on every switch, which breaks multiboxing.
+    fn focus_without_warp(&self, sel: &str) -> Result<()> {
+        match self.syntax {
+            DispatchSyntax::Lua => {
+                run_hyprctl(&["eval".into(), no_warp_focus_lua(sel)]).map(|_| ())
+            }
+            DispatchSyntax::Legacy => {
+                let user_no_warps =
+                    run_hyprctl(&["getoption".into(), "cursor:no_warps".into(), "-j".into()])
+                        .ok()
+                        .and_then(|out| serde_json::from_slice::<Value>(&out).ok())
+                        .and_then(|v| v.get("int").and_then(|i| i.as_i64()))
+                        .is_some_and(|i| i != 0);
+                if user_no_warps {
+                    return self.dispatch(HyprDispatch::focus(sel));
+                }
+                run_hyprctl(&["--batch".into(), no_warp_focus_batch(sel, false)]).map(|_| ())
+            }
+        }
     }
 
     fn get_all_windows(&self) -> Result<Vec<Value>> {
@@ -808,7 +856,7 @@ impl WindowManager for HyprlandManager {
     }
 
     fn activate_window(&self, window_id: u32) -> Result<()> {
-        self.dispatch(HyprDispatch::focus(&self.selector(window_id)?))
+        self.focus_without_warp(&self.selector(window_id)?)
             .context("Failed to activate window")
     }
 
@@ -849,7 +897,7 @@ impl WindowManager for HyprlandManager {
         self.dispatch(HyprDispatch::to_special(&sel))
             .context("Failed to minimize window")?;
         if let Some(prev) = previous.filter(|a| hypr_window_id(*a) != window_id) {
-            self.dispatch(HyprDispatch::focus(&format!("address:0x{prev:x}")))?;
+            self.focus_without_warp(&format!("address:0x{prev:x}"))?;
         }
         Ok(())
     }
@@ -1130,6 +1178,28 @@ mod hyprland_tests {
         assert_eq!(
             HyprDispatch::move_to(sel, 6400, 0).lua,
             r#"hl.dsp.window.move({ x = 6400, y = 0, window = "address:0x55eb4b6c12e0" })"#
+        );
+    }
+
+    #[test]
+    fn focus_never_warps_and_restores_user_setting() {
+        let sel = "address:0x55eb4b6c12e0";
+        let lua = no_warp_focus_lua(sel);
+        // Forced on, dispatched under pcall, then restored to the saved
+        // value before any error is re-raised.
+        let set = lua.find("no_warps = true").unwrap();
+        let focus = lua
+            .find(r#"pcall(hl.dispatch, hl.dsp.focus({ window = "address:0x55eb4b6c12e0" }))"#)
+            .unwrap();
+        let restore = lua.find("no_warps = prev").unwrap();
+        let reraise = lua.find("if not ok then error(err) end").unwrap();
+        assert!(lua.starts_with(r#"local prev = hl.get_config("cursor.no_warps")"#));
+        assert!(set < focus && focus < restore && restore < reraise);
+
+        assert_eq!(
+            no_warp_focus_batch(sel, false),
+            "keyword cursor:no_warps true ; dispatch focuswindow address:0x55eb4b6c12e0 ; \
+             keyword cursor:no_warps false"
         );
     }
 
