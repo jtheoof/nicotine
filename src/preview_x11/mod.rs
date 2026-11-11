@@ -116,16 +116,16 @@ const NICOTINE_GOLD: (u8, u8, u8) = (180, 155, 105);
 // egui overlay's look: 2px gold border around the whole window, red
 // title strip with "Nicotine" in Marlboro, cream body, one row per
 // character with the active row in Nicotine red.
-const LIST_WIDTH: u16 = 220;
-const LIST_BORDER: u16 = 2;
-const LIST_TITLE_STRIP_HEIGHT: u16 = 44;
+pub(crate) const LIST_WIDTH: u16 = 220;
+pub(crate) const LIST_BORDER: u16 = 2;
+pub(crate) const LIST_TITLE_STRIP_HEIGHT: u16 = 44;
 const LIST_TITLE_FONT_PX: f32 = 32.0;
-const LIST_ROW_HEIGHT: u16 = 22;
+pub(crate) const LIST_ROW_HEIGHT: u16 = 22;
 const LIST_ROW_FONT_PX: f32 = 13.0;
-const LIST_ROW_LEFT_PAD: i16 = 16;
-const LIST_ROW_RIGHT_PAD: i16 = 16;
-const LIST_ROW_TOP_PAD: i16 = 14;
-const LIST_BOTTOM_PAD: u16 = 12;
+pub(crate) const LIST_ROW_LEFT_PAD: i16 = 16;
+pub(crate) const LIST_ROW_RIGHT_PAD: i16 = 16;
+pub(crate) const LIST_ROW_TOP_PAD: i16 = 14;
+pub(crate) const LIST_BOTTOM_PAD: u16 = 12;
 
 mod events;
 mod list;
@@ -142,7 +142,7 @@ pub(crate) use render::thumbnail_size;
 /// the 2-px gold border top and bottom, the red title strip, the
 /// top-pad gap below it, the rows themselves, and a bottom pad above
 /// the bottom border.
-fn list_window_height(num_clients: usize) -> u16 {
+pub(crate) fn list_window_height(num_clients: usize) -> u16 {
     let rows = num_clients.max(1) as u16;
     LIST_BORDER * 2
         + LIST_TITLE_STRIP_HEIGHT

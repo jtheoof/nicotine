@@ -27,9 +27,12 @@
 //! Click-to-activate goes through the daemon's `WindowManager`; drag with
 //! snap-to-dock persists to the shared `preview_positions.toml`.
 //!
-//! Prototype limits: Previews display mode only (List mode is not drawn
-//! yet), chrome is rendered at scale 1, and a preview stays on the output
-//! it was created on (drags are clamped to that output).
+//! List display mode is one more layer surface: a "Nicotine" title strip
+//! and one row per running client in cycle order, the active one marked.
+//! It can be dragged (position saved as `list_position`) and clicking a
+//! row focuses that client.
+//!
+//! Chrome is rendered at scale 1.
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -108,9 +111,13 @@ use crate::preview_common::{
     preview_should_hide, snap_position, DragRect, DragState, DRAG_THRESHOLD_PX, SNAP_THRESHOLD_PX,
 };
 use crate::preview_positions::PreviewPositions;
-use crate::preview_x11::{thumbnail_size, BORDER_WIDTH, TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD};
+use crate::preview_x11::{
+    list_window_height, thumbnail_size, BORDER_WIDTH, LIST_BORDER, LIST_ROW_HEIGHT,
+    LIST_ROW_LEFT_PAD, LIST_ROW_RIGHT_PAD, LIST_ROW_TOP_PAD, LIST_TITLE_STRIP_HEIGHT, LIST_WIDTH,
+    TITLE_STRIP_HEIGHT, TITLE_TEXT_LEFT_PAD,
+};
 use crate::text_render::{self, Antialias, TextFont, TextMask};
-use crate::theme::{PreviewTheme, Rgb};
+use crate::theme::{PanelPalette, PreviewTheme, Rgb};
 use crate::window_manager::{
     detect_display_server, detect_wayland_compositor, DisplayServer, WaylandCompositor,
     WindowManager,
@@ -137,6 +144,12 @@ const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 /// `DRM_FORMAT_MOD_INVALID`: "implicit modifier" in modifier lists.
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// "Nicotine" wordmark size in the list's title strip (pixels per em;
+/// matches the X11 list's look).
+const LIST_TITLE_EM_PX: f32 = 35.6;
+/// Largest row font that fits a list row.
+const LIST_ROW_MAX_EM_PX: f32 = 16.0;
+
 /// `BTN_LEFT` from linux/input-event-codes.h.
 const BTN_LEFT: u32 = 0x110;
 /// `zwlr_foreign_toplevel_handle_v1.state` value for "activated".
@@ -181,21 +194,23 @@ pub fn spawn(
     live: Arc<Mutex<LiveSettings>>,
     font: FontSettings,
     theme: PreviewTheme,
+    list_palette: PanelPalette,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
         .name("preview-wayland".into())
         .spawn(move || {
-            let (mut queue, mut manager) = match Manager::connect(wm, state, live, font, theme) {
-                Ok(v) => {
-                    let _ = tx.send(Ok(()));
-                    v
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
+            let (mut queue, mut manager) =
+                match Manager::connect(wm, state, live, font, theme, list_palette) {
+                    Ok(v) => {
+                        let _ = tx.send(Ok(()));
+                        v
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                };
             if let Err(e) = manager.run(&mut queue) {
                 eprintln!("Wayland preview manager exited with error: {e:#}");
             }
@@ -360,6 +375,48 @@ impl Preview {
 
     fn thumb_size(&self) -> (u16, u16) {
         thumbnail_size(self.width as u16, self.height as u16)
+    }
+}
+
+/// The List display mode window.
+struct ListWindow {
+    layer: LayerSurface,
+    output_origin: (i32, i32),
+    output_size: (i32, i32),
+    /// Global logical position of the top-left corner.
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    configured: bool,
+    /// Kept alive while the compositor shows it.
+    buf: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    /// Character names, one row each, in cycle order.
+    names: Vec<String>,
+    row_masks: Vec<TextMask>,
+    drag: DragState,
+    press_local: (f64, f64),
+    drag_delta: (f64, f64),
+    pending_move: bool,
+}
+
+impl ListWindow {
+    fn apply_margins(&self) {
+        self.layer.set_margin(
+            self.y - self.output_origin.1,
+            0,
+            0,
+            self.x - self.output_origin.0,
+        );
+    }
+
+    fn output(&self) -> OutRect {
+        OutRect {
+            x: self.output_origin.0,
+            y: self.output_origin.1,
+            w: self.output_size.0,
+            h: self.output_size.1,
+        }
     }
 }
 
@@ -548,7 +605,11 @@ struct Manager {
     last_applied_opacity: u32,
     needs_reconcile: bool,
     last_reconcile: Instant,
-    warned_list_mode: bool,
+    /// List display mode window, when that mode is on.
+    list: Option<ListWindow>,
+    list_palette: PanelPalette,
+    /// "Nicotine" wordmark for the list's title strip.
+    list_title: TextMask,
 }
 
 impl Manager {
@@ -558,6 +619,7 @@ impl Manager {
         live: Arc<Mutex<LiveSettings>>,
         font: FontSettings,
         theme: PreviewTheme,
+        list_palette: PanelPalette,
     ) -> Result<(EventQueue<Self>, Self)> {
         let title_font = TextFont::load_or_bundled(font.font.as_deref());
         let antialias = match font.antialias.as_deref() {
@@ -654,7 +716,14 @@ impl Manager {
             last_applied_opacity: 0,
             needs_reconcile: true,
             last_reconcile: Instant::now(),
-            warned_list_mode: false,
+            list: None,
+            list_palette,
+            list_title: text_render::rasterize(
+                &TextFont::marlboro(),
+                "Nicotine",
+                LIST_TITLE_EM_PX,
+                Antialias::Grayscale,
+            ),
         };
         // Two roundtrips: the first delivers globals' initial events
         // (outputs, toplevels), the second the follow-ups they trigger
@@ -736,15 +805,18 @@ impl Manager {
                 l.preview_opacity,
             )
         };
-        self.relocate_previews();
-        if mode == DisplayMode::List && !self.warned_list_mode {
-            eprintln!("List display mode isn't implemented on the Wayland preview backend yet");
-            self.warned_list_mode = true;
-        }
-        if !show || mode != DisplayMode::Previews {
+        if !show {
             self.previews.clear();
+            self.list = None;
             return;
         }
+        if mode == DisplayMode::List {
+            self.previews.clear();
+            self.reconcile_list(qh);
+            return;
+        }
+        self.list = None;
+        self.relocate_previews();
 
         // Characters the daemon has already process-gated (pid →
         // exefile.exe via hyprctl), so a browser tab titled "EVE - …"
@@ -1132,8 +1204,266 @@ impl Manager {
                 self.draw_chrome(id);
             }
         }
+        self.draw_list();
         // hide_active_preview depends on this; reconcile right away.
         self.needs_reconcile = true;
+    }
+
+    // ---- list mode -------------------------------------------------------
+
+    /// Rows for the list: running clients in cycle order.
+    fn list_names(&self) -> Vec<String> {
+        self.state
+            .lock_recover()
+            .get_ordered_windows()
+            .into_iter()
+            .map(|w| w.title)
+            .collect()
+    }
+
+    /// Monitor the list belongs on: the "Preview monitor" choice, or with
+    /// Auto the first listed client's monitor (stable across cycling, so
+    /// the list doesn't hop between monitors when clients are spread out).
+    fn list_target_output(&self, names: &[String]) -> Option<OutRect> {
+        self.fixed_output()
+            .or_else(|| names.first().and_then(|n| self.eve_output(n)))
+    }
+
+    fn reconcile_list(&mut self, qh: &QueueHandle<Self>) {
+        let names = self.list_names();
+        let target = self.list_target_output(&names);
+
+        // Follow the target monitor (rebuild there, offset kept).
+        if let (Some(list), Some(t)) = (&self.list, target) {
+            if !list.drag.active {
+                let rects: Vec<OutRect> = self.output_rects().into_iter().map(|(_, r)| r).collect();
+                let size = (list.width as i32, list.height as i32);
+                if let Some(pos) = relocation(t, list.output_origin, (list.x, list.y), &rects, size)
+                {
+                    let mut positions = self.positions.lock_recover();
+                    positions.list_position = Some(pos);
+                    positions.save();
+                    drop(positions);
+                    self.list = None;
+                }
+            }
+        }
+
+        let Some(list) = &mut self.list else {
+            if let Err(e) = self.create_list(qh, names, target) {
+                eprintln!("Create Wayland list window failed: {e:#}");
+            }
+            return;
+        };
+        if list.names == names {
+            return;
+        }
+        let row_px = self.title_font_px.min(LIST_ROW_MAX_EM_PX);
+        let aa = self.antialias.unwrap_or(Antialias::Grayscale);
+        list.row_masks = names
+            .iter()
+            .map(|n| text_render::rasterize(&self.title_font, n, row_px, aa))
+            .collect();
+        let height = list_window_height(names.len()) as u32;
+        list.names = names;
+        if height != list.height {
+            // Redrawn on the configure that follows.
+            list.height = height;
+            list.layer.set_size(list.width, height);
+            list.layer.commit();
+        } else {
+            self.draw_list();
+        }
+    }
+
+    fn create_list(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        names: Vec<String>,
+        target: Option<OutRect>,
+    ) -> Result<()> {
+        let (w, h) = (LIST_WIDTH as u32, list_window_height(names.len()) as u32);
+        let saved = self.positions.lock_recover().list_position;
+        let rects: Vec<OutRect> = self.output_rects().into_iter().map(|(_, r)| r).collect();
+        let (x, y) = match target {
+            Some(t) => saved
+                .and_then(|pos| carry_to_output(t, pos, &rects, w as i32, h as i32))
+                .unwrap_or_else(|| default_position(t, 0)),
+            None => saved
+                .filter(|(x, y)| output_index_at(&rects, *x, *y).is_some())
+                .or_else(|| rects.first().map(|r| default_position(*r, 0)))
+                .ok_or_else(|| anyhow::anyhow!("no outputs with known geometry"))?,
+        };
+        let (output, output_origin, output_size) = self
+            .pick_output(x, y)
+            .ok_or_else(|| anyhow::anyhow!("no outputs with known geometry"))?;
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("nicotine-list"),
+            Some(&output),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_size(w, h);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+        let row_px = self.title_font_px.min(LIST_ROW_MAX_EM_PX);
+        let aa = self
+            .antialias
+            .unwrap_or_else(|| self.output_antialias(&output));
+        let row_masks = names
+            .iter()
+            .map(|n| text_render::rasterize(&self.title_font, n, row_px, aa))
+            .collect();
+
+        let list = ListWindow {
+            layer,
+            output_origin,
+            output_size,
+            x,
+            y,
+            width: w,
+            height: h,
+            configured: false,
+            buf: None,
+            names,
+            row_masks,
+            drag: DragState::default(),
+            press_local: (0.0, 0.0),
+            drag_delta: (0.0, 0.0),
+            pending_move: false,
+        };
+        list.apply_margins();
+        list.layer.commit();
+        self.list = Some(list);
+        Ok(())
+    }
+
+    fn draw_list(&mut self) {
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        if !list.configured {
+            return;
+        }
+        let (w, h) = (list.width as i32, list.height as i32);
+        let Ok((buffer, canvas)) =
+            self.chrome_pool
+                .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
+        else {
+            eprintln!("Wayland list: buffer allocation failed");
+            return;
+        };
+        let active = self
+            .active_character
+            .as_deref()
+            .and_then(|a| list.names.iter().position(|n| n == a));
+        paint_list(
+            canvas,
+            w as usize,
+            h as usize,
+            &self.list_palette,
+            &self.list_title,
+            &list.row_masks,
+            active,
+        );
+        let surface = list.layer.wl_surface();
+        if buffer.attach_to(surface).is_err() {
+            return;
+        }
+        surface.damage_buffer(0, 0, w, h);
+        surface.commit();
+        list.buf = Some(buffer);
+    }
+
+    /// Release (or a lost release) on the list: a drag saves its
+    /// position, a click on a row focuses that client.
+    fn finish_list_drag(&mut self, end: DragEnd) {
+        self.apply_drag_moves();
+        let Some(list) = &mut self.list else {
+            return;
+        };
+        if !list.drag.active {
+            return;
+        }
+        let dragged = list.drag.dragged;
+        list.drag = DragState::default();
+        if dragged {
+            let mut positions = self.positions.lock_recover();
+            positions.list_position = Some((list.x, list.y));
+            positions.save();
+            return;
+        }
+        if end != DragEnd::Release {
+            return;
+        }
+        let row = list_row_at(list.press_local.1, list.names.len());
+        if let Some(name) = row.map(|i| list.names[i].clone()) {
+            self.activate(&name);
+        }
+    }
+
+    fn handle_list_pointer(&mut self, event: &PointerEvent) {
+        let locked = self.live.lock_recover().positions_locked;
+        match event.kind {
+            PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
+                if let Some(l) = &mut self.list {
+                    l.drag = DragState {
+                        active: true,
+                        dragged: false,
+                        origin_screen: (
+                            l.x + event.position.0 as i32,
+                            l.y + event.position.1 as i32,
+                        ),
+                        origin_window: (l.x, l.y),
+                    };
+                    l.press_local = event.position;
+                    l.drag_delta = (0.0, 0.0);
+                    l.pending_move = false;
+                }
+            }
+            PointerEventKind::Motion { .. } if self.relative_pointer.is_none() => {
+                let Some(l) = &mut self.list else {
+                    return;
+                };
+                if !l.drag.active || locked {
+                    return;
+                }
+                l.drag_delta = (
+                    (l.x as f64 + event.position.0) - l.drag.origin_screen.0 as f64,
+                    (l.y as f64 + event.position.1) - l.drag.origin_screen.1 as f64,
+                );
+                l.pending_move = true;
+            }
+            PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
+                self.finish_list_drag(DragEnd::Release);
+            }
+            PointerEventKind::Enter { .. } => self.settle_stale_drags(),
+            _ => {}
+        }
+    }
+
+    /// A drag still marked active when the pointer enters one of our
+    /// surfaces lost its release to another surface (Hyprland can stop
+    /// delivering events to a layer surface once the cursor leaves it):
+    /// settle it.
+    fn settle_stale_drags(&mut self) {
+        let stale: Vec<u64> = self
+            .previews
+            .values()
+            .filter(|p| p.drag.active)
+            .map(|p| p.id)
+            .collect();
+        for id in stale {
+            self.finish_drag(id, DragEnd::Stale);
+        }
+        if self.list.as_ref().is_some_and(|l| l.drag.active) {
+            self.finish_list_drag(DragEnd::Stale);
+        }
     }
 
     // ---- capture ---------------------------------------------------------
@@ -1439,6 +1769,17 @@ impl Manager {
             p.drag_delta = (next.0 - origin.0, next.1 - origin.1);
             p.pending_move = true;
         }
+        if let Some(l) = self.list.as_mut().filter(|l| l.drag.active) {
+            let origin = (l.drag.origin_screen.0 as f64, l.drag.origin_screen.1 as f64);
+            let prev = (origin.0 + l.drag_delta.0, origin.1 + l.drag_delta.1);
+            let next = confine_pointer(
+                &rects,
+                prev,
+                (prev.0 + event.delta.0, prev.1 + event.delta.1),
+            );
+            l.drag_delta = (next.0 - origin.0, next.1 - origin.1);
+            l.pending_move = true;
+        }
     }
 
     /// Move dragged previews to `origin + drag_delta`, snapped to other
@@ -1474,30 +1815,50 @@ impl Manager {
                 }
                 p.drag.dragged = true;
             }
-            let proposed_x = p.drag.origin_window.0 + dx.round() as i32;
-            let proposed_y = p.drag.origin_window.1 + dy.round() as i32;
-            let (sx, sy) = snap_position(
-                proposed_x,
-                proposed_y,
-                p.width as i32,
-                p.height as i32,
-                &others,
-                SNAP_THRESHOLD_PX,
-            );
-            // A layer surface can't straddle outputs, and which monitor a
-            // preview is on is decided by the "Preview monitor" setting,
-            // so drags stay within the current one.
             let current = OutRect {
                 x: p.output_origin.0,
                 y: p.output_origin.1,
                 w: p.output_size.0,
                 h: p.output_size.1,
             };
-            let (x, y) = current.clamp_box(sx, sy, p.width as i32, p.height as i32);
+            let (x, y) = dragged_position(
+                p.drag.origin_window,
+                (dx, dy),
+                (p.width as i32, p.height as i32),
+                &others,
+                current,
+            );
             if (x, y) != (p.x, p.y) {
                 (p.x, p.y) = (x, y);
                 p.apply_margins();
                 p.layer.commit();
+            }
+        }
+
+        let others: Vec<DragRect> = self.previews.values().map(Preview::rect).collect();
+        if let Some(l) = self.list.as_mut().filter(|l| l.pending_move) {
+            l.pending_move = false;
+            if !l.drag.active {
+                return;
+            }
+            let (dx, dy) = l.drag_delta;
+            if !l.drag.dragged {
+                if dx.abs() < DRAG_THRESHOLD_PX as f64 && dy.abs() < DRAG_THRESHOLD_PX as f64 {
+                    return;
+                }
+                l.drag.dragged = true;
+            }
+            let (x, y) = dragged_position(
+                l.drag.origin_window,
+                (dx, dy),
+                (l.width as i32, l.height as i32),
+                &others,
+                l.output(),
+            );
+            if (x, y) != (l.x, l.y) {
+                (l.x, l.y) = (x, y);
+                l.apply_margins();
+                l.layer.commit();
             }
         }
     }
@@ -1528,6 +1889,14 @@ impl Manager {
     }
 
     fn handle_pointer(&mut self, event: &PointerEvent) {
+        if self
+            .list
+            .as_ref()
+            .is_some_and(|l| l.layer.wl_surface() == &event.surface)
+        {
+            self.handle_list_pointer(event);
+            return;
+        }
         let Some(id) = self.preview_for_surface(&event.surface) else {
             return;
         };
@@ -1573,19 +1942,126 @@ impl Manager {
             // the cursor leaves it mid-drag, so the release can go to
             // another surface. Entering any preview while a drag is still
             // marked active means that happened: settle it.
-            PointerEventKind::Enter { .. } => {
-                let stale: Vec<u64> = self
-                    .previews
-                    .values()
-                    .filter(|p| p.drag.active)
-                    .map(|p| p.id)
-                    .collect();
-                for id in stale {
-                    self.finish_drag(id, DragEnd::Stale);
-                }
-            }
+            PointerEventKind::Enter { .. } => self.settle_stale_drags(),
             _ => {}
         }
+    }
+}
+
+/// Where a surface dragged by `delta` from `origin_window` goes: snapped
+/// to the edges of `others`, then kept inside `output` (a layer surface
+/// can't straddle monitors, and the "Preview monitor" setting decides
+/// which one it's on).
+fn dragged_position(
+    origin_window: (i32, i32),
+    delta: (f64, f64),
+    size: (i32, i32),
+    others: &[DragRect],
+    output: OutRect,
+) -> (i32, i32) {
+    let (sx, sy) = snap_position(
+        origin_window.0 + delta.0.round() as i32,
+        origin_window.1 + delta.1.round() as i32,
+        size.0,
+        size.1,
+        others,
+        SNAP_THRESHOLD_PX,
+    );
+    output.clamp_box(sx, sy, size.0, size.1)
+}
+
+/// First list row's top edge, in list-surface pixels.
+fn list_rows_top() -> f64 {
+    (LIST_BORDER + LIST_TITLE_STRIP_HEIGHT) as f64 + LIST_ROW_TOP_PAD as f64
+}
+
+/// Row under surface-local `y` in a list of `rows` rows, if any.
+fn list_row_at(y: f64, rows: usize) -> Option<usize> {
+    let offset = y - list_rows_top();
+    if offset < 0.0 {
+        return None;
+    }
+    let row = (offset / LIST_ROW_HEIGHT as f64) as usize;
+    (row < rows).then_some(row)
+}
+
+/// Paint the list window: `subtle` border, `accent` title strip with the
+/// centred wordmark in `on_accent`, `background` body, rows in `text`,
+/// the active row in `accent` with a ▸ marker (drawn, so any row font
+/// works). `canvas` is ARGB8888 little-endian.
+fn paint_list(
+    canvas: &mut [u8],
+    w: usize,
+    h: usize,
+    pal: &PanelPalette,
+    title: &TextMask,
+    rows: &[TextMask],
+    active: Option<usize>,
+) {
+    let px = |c: Rgb| [c.2, c.1, c.0, 0xff];
+    let border = LIST_BORDER as usize;
+    let strip_bottom = border + LIST_TITLE_STRIP_HEIGHT as usize;
+    for y in 0..h {
+        for x in 0..w {
+            let c = if x < border || y < border || x + border >= w || y + border >= h {
+                pal.subtle
+            } else if y < strip_bottom {
+                pal.accent
+            } else {
+                pal.background
+            };
+            let off = (y * w + x) * 4;
+            canvas[off..off + 4].copy_from_slice(&px(c));
+        }
+    }
+
+    let title_x = w.saturating_sub(title.width) / 2;
+    let title_y = border + (LIST_TITLE_STRIP_HEIGHT as usize).saturating_sub(title.height) / 2;
+    let title_clip = TextMask {
+        height: title.height.min(strip_bottom.saturating_sub(title_y)),
+        ..title.clone()
+    };
+    text_render::blend_mask(
+        canvas,
+        w,
+        h,
+        title_x,
+        title_y,
+        w.saturating_sub(title_x + border),
+        &title_clip,
+        pal.on_accent,
+    );
+
+    let left = LIST_ROW_LEFT_PAD as usize;
+    let text_w = w.saturating_sub(left + LIST_ROW_RIGHT_PAD as usize);
+    let row_h = LIST_ROW_HEIGHT as usize;
+    for (i, mask) in rows.iter().enumerate() {
+        let row_top = list_rows_top() as usize + i * row_h;
+        if row_top + row_h > h.saturating_sub(border) {
+            break;
+        }
+        let is_active = active == Some(i);
+        let color = if is_active { pal.accent } else { pal.text };
+        if is_active {
+            // ▸ in the left padding, vertically centred in the row.
+            let (mw, mh) = (5usize, 9usize);
+            let mx = left.saturating_sub(mw + 5);
+            let my = row_top + (row_h - mh) / 2;
+            let half = mh / 2;
+            for dy in 0..mh {
+                let span = (half - dy.abs_diff(half)) * mw / half + 1;
+                for dx in 0..span.min(mw) {
+                    let off = ((my + dy) * w + mx + dx) * 4;
+                    canvas[off..off + 4].copy_from_slice(&px(color));
+                }
+            }
+        }
+        let text_top = row_top + row_h.saturating_sub(mask.height) / 2;
+        let clipped = TextMask {
+            height: mask.height.min((row_top + row_h).saturating_sub(text_top)),
+            ..mask.clone()
+        };
+        text_render::blend_mask(canvas, w, h, left, text_top, text_w, &clipped, color);
     }
 }
 
@@ -1783,8 +2259,11 @@ impl OutputHandler for Manager {
 impl LayerShellHandler for Manager {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         // Output went away (or the compositor closed us); drop the
-        // preview and let reconcile recreate it on a live output.
+        // surface and let reconcile recreate it on a live output.
         self.previews.retain(|_, p| &p.layer != layer);
+        if self.list.as_ref().is_some_and(|l| &l.layer == layer) {
+            self.list = None;
+        }
         self.needs_reconcile = true;
     }
 
@@ -1796,6 +2275,16 @@ impl LayerShellHandler for Manager {
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
+        if let Some(list) = self.list.as_mut().filter(|l| &l.layer == layer) {
+            let (cw, ch) = configure.new_size;
+            if cw > 0 && ch > 0 {
+                list.width = cw;
+                list.height = ch;
+            }
+            list.configured = true;
+            self.draw_list();
+            return;
+        }
         let Some(id) = self
             .previews
             .values()
@@ -2331,6 +2820,189 @@ mod tests {
     }
 
     #[test]
+    fn list_rows_hit_test() {
+        let top = list_rows_top();
+        let row_h = LIST_ROW_HEIGHT as f64;
+        // Title strip and the padding above the first row: no row.
+        assert_eq!(list_row_at(5.0, 3), None);
+        assert_eq!(list_row_at(top - 1.0, 3), None);
+        assert_eq!(list_row_at(top, 3), Some(0));
+        assert_eq!(list_row_at(top + row_h - 0.5, 3), Some(0));
+        assert_eq!(list_row_at(top + row_h, 3), Some(1));
+        assert_eq!(list_row_at(top + 2.5 * row_h, 3), Some(2));
+        // Below the last row (bottom padding) or an empty list.
+        assert_eq!(list_row_at(top + 3.0 * row_h, 3), None);
+        assert_eq!(list_row_at(top, 0), None);
+    }
+
+    fn pixel(canvas: &[u8], w: usize, x: usize, y: usize) -> Rgb {
+        let off = (y * w + x) * 4;
+        (canvas[off + 2], canvas[off + 1], canvas[off])
+    }
+
+    #[test]
+    fn list_paints_theme_roles_and_marks_active_row() {
+        for pal in [
+            crate::theme::Theme::NICOTINE.panel,
+            crate::theme::Theme::NORD_DARK.panel,
+        ] {
+            let rows = 3;
+            let (w, h) = (LIST_WIDTH as usize, list_window_height(rows) as usize);
+            let mut canvas = vec![0u8; w * h * 4];
+            let solid = TextMask {
+                width: 6,
+                height: 6,
+                baseline: 6,
+                subpixel: false,
+                data: vec![255; 36],
+            };
+            let masks = vec![solid.clone(); rows];
+            paint_list(
+                &mut canvas,
+                w,
+                h,
+                &pal,
+                &TextMask::default(),
+                &masks,
+                Some(1),
+            );
+
+            // Border, title strip, body.
+            assert_eq!(pixel(&canvas, w, 0, 0), pal.subtle);
+            assert_eq!(pixel(&canvas, w, w - 1, h - 1), pal.subtle);
+            assert_eq!(pixel(&canvas, w, w / 2, 10), pal.accent);
+            assert_eq!(pixel(&canvas, w, w - 10, h - 6), pal.background);
+
+            let row_h = LIST_ROW_HEIGHT as usize;
+            let left = LIST_ROW_LEFT_PAD as usize;
+            let text_y = |i: usize| list_rows_top() as usize + i * row_h + (row_h - 6) / 2 + 2;
+            // Inactive rows' text in `text`, the active row's in `accent`.
+            assert_eq!(pixel(&canvas, w, left + 2, text_y(0)), pal.text);
+            assert_eq!(pixel(&canvas, w, left + 2, text_y(1)), pal.accent);
+            assert_eq!(pixel(&canvas, w, left + 2, text_y(2)), pal.text);
+            // ▸ marker only on the active row (its middle row is widest).
+            let marker_x = left - 10;
+            let mid = |i: usize| list_rows_top() as usize + i * row_h + (row_h - 9) / 2 + 4;
+            assert_eq!(pixel(&canvas, w, marker_x, mid(1)), pal.accent);
+            assert_eq!(pixel(&canvas, w, marker_x, mid(0)), pal.background);
+        }
+    }
+
+    #[test]
+    fn dragged_position_snaps_then_stays_on_output() {
+        let size = (200, 100);
+        // Plain move.
+        assert_eq!(
+            dragged_position((7000, 500), (50.4, -20.6), size, &[], DP3),
+            (7050, 479)
+        );
+        // Snaps to a neighbour's left edge within the threshold.
+        let other = DragRect {
+            left: 7260,
+            top: 900,
+            right: 7460,
+            bottom: 1000,
+        };
+        assert_eq!(
+            dragged_position((7000, 500), (55.0, 0.0), size, &[other], DP3).0,
+            7060
+        );
+        // Dragged past the monitor's edge: clamped to it.
+        assert_eq!(
+            dragged_position((7000, 500), (-5000.0, -900.0), size, &[], DP3),
+            (DP3.x, DP3.y)
+        );
+    }
+
+    /// Live: a List-mode window on the running compositor gets configured
+    /// and drawn. Run with
+    /// `cargo test --bin Nicotine live_hyprland_list_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a live Hyprland session"]
+    fn live_hyprland_list_smoke() {
+        struct NoWm;
+        impl WindowManager for NoWm {
+            fn get_eve_windows(&self) -> Result<Vec<crate::window_manager::EveWindow>> {
+                Ok(Vec::new())
+            }
+            fn activate_window(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            fn stack_windows(
+                &self,
+                _: &[crate::window_manager::EveWindow],
+                _: &crate::config::Config,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn get_active_window(&self) -> Result<u32> {
+                Ok(0)
+            }
+            fn minimize_window(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+            fn restore_window(&self, _: u32) -> Result<()> {
+                Ok(())
+            }
+        }
+        let state = Arc::new(Mutex::new(CycleState::new()));
+        state
+            .lock()
+            .unwrap()
+            .update_windows(vec![crate::window_manager::EveWindow {
+                id: 1,
+                title: "List Smoke".into(),
+            }]);
+        let live = Arc::new(Mutex::new(LiveSettings {
+            preview_width: 480,
+            preview_height: 270,
+            preview_opacity: 100,
+            display_mode: DisplayMode::List,
+            positions_locked: true,
+            show_previews: true,
+            hide_active_preview: false,
+            preview_output: None,
+            outputs: Vec::new(),
+        }));
+        let (mut queue, mut m) = Manager::connect(
+            Arc::new(NoWm),
+            state,
+            live,
+            FontSettings {
+                font: None,
+                size_px: 14.0,
+                antialias: None,
+            },
+            crate::theme::Theme::NORD_DARK.preview,
+            crate::theme::Theme::NORD_DARK.panel,
+        )
+        .expect("bind Wayland globals");
+        // Don't touch the user's saved list position.
+        m.positions = Arc::new(Mutex::new(PreviewPositions::default()));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            m.pump_events(&mut queue).expect("wayland connection");
+            m.tick(&queue.handle());
+        }
+        let list = m.list.as_ref().expect("list window created");
+        println!(
+            "list at ({}, {}) {}x{} rows={:?} configured={} drawn={}",
+            list.x,
+            list.y,
+            list.width,
+            list.height,
+            list.names,
+            list.configured,
+            list.buf.is_some()
+        );
+        assert!(m.previews.is_empty(), "no previews in List mode");
+        assert!(list.configured && list.buf.is_some());
+        assert_eq!(list.names, ["List Smoke"]);
+        m.list = None;
+        m.pump_events(&mut queue).unwrap();
+    }
+
+    #[test]
     fn relocation_moves_previews_onto_their_target_monitor() {
         let outs = [DP1, DP3, DP2];
         let size = (207, 131);
@@ -2457,6 +3129,7 @@ mod tests {
             live,
             font,
             PreviewTheme::from_config(std::env::var("NICOTINE_TEST_THEME").ok().as_deref(), None),
+            crate::theme::Theme::NICOTINE.panel,
         )
         .expect("bind Wayland globals");
         let qh = queue.handle();
