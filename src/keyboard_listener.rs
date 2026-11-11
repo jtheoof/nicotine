@@ -5,12 +5,13 @@
 
 use crate::config::{CharacterHotkey, Config, LiveSettings};
 use crate::cycle_state::CycleState;
+use crate::input_actions::{fetch_bounded, ActionQueue, InputAction};
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use evdev::{Device, InputEventKind, Key};
+use evdev::{Device, EventType, KeyCode};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,6 +73,9 @@ impl KeyboardListener {
         state: Arc<Mutex<CycleState>>,
         live: Arc<Mutex<LiveSettings>>,
     ) {
+        // Cycling/switching runs on a worker so a slow window-manager
+        // round-trip never stalls reading (see `input_actions`).
+        let actions = ActionQueue::spawn("keyboard", wm, state);
         let mut device: Option<Device> = None;
         let mut current_dev_path: Option<String> = None;
         // Modifier-down state. Reset on (re)connect because the kernel
@@ -157,15 +161,16 @@ impl KeyboardListener {
             // "stuck" in the pressed set.
             pressed_modifiers.retain(|c| modifier_codes.contains(c));
 
-            // See mouse_listener::run_listener for why we go through
-            // BorrowedFd::borrow_raw: evdev::Device is AsRawFd but not
-            // AsFd, and the immutable borrow has to release before we
-            // mutably borrow for fetch_events.
-            let raw_fd = device.as_ref().expect("device set above").as_raw_fd();
-            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-            let mut pollfds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-            let n = match poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS)) {
-                Ok(n) => n,
+            // Scoped so the shared borrow of `device` ends before the
+            // mutable one fetch_events needs.
+            let polled = {
+                let fd = device.as_ref().expect("device set above").as_fd();
+                let mut pollfds = [PollFd::new(fd, PollFlags::POLLIN)];
+                poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS))
+                    .map(|n| (n, pollfds[0].revents().unwrap_or_else(PollFlags::empty)))
+            };
+            let (n, revents) = match polled {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("Keyboard poll failed ({}); reconnecting.", e);
                     device = None;
@@ -175,20 +180,12 @@ impl KeyboardListener {
             if n == 0 {
                 continue;
             }
-            let revents = pollfds[0].revents().unwrap_or_else(PollFlags::empty);
             if !revents.contains(PollFlags::POLLIN) {
                 eprintln!("Keyboard device hung up; reconnecting.");
                 device = None;
                 continue;
             }
-            // Detach events from the device borrow — see the same
-            // collect() note in mouse_listener.
-            let events_result = device
-                .as_mut()
-                .unwrap()
-                .fetch_events()
-                .map(|it| it.collect::<Vec<_>>());
-            let events = match events_result {
+            let events = match fetch_bounded(device.as_mut().unwrap()) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("Keyboard device read failed ({}); reconnecting.", e);
@@ -197,10 +194,10 @@ impl KeyboardListener {
                 }
             };
             for event in events {
-                let InputEventKind::Key(key) = event.kind() else {
+                if event.event_type() != EventType::KEY {
                     continue;
-                };
-                let code = key.code();
+                }
+                let code = event.code();
 
                 // Track press/release of modifier-eligible keys.
                 if modifier_codes.contains(&code) {
@@ -247,22 +244,17 @@ impl KeyboardListener {
                         .modifier_key
                         .map(|m| pressed_modifiers.contains(&m))
                         .unwrap_or(false);
+                    let minimize_inactive = snap.minimize_inactive;
                     if code == snap.backward_key && main_modifier_held {
-                        if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
-                            eprintln!("Failed to cycle backward: {}", e);
-                        }
+                        actions.push(InputAction::Backward { minimize_inactive });
                         continue;
                     }
                     if code == snap.forward_key {
-                        if let Err(e) = Self::cycle_forward(&wm, &state, snap.minimize_inactive) {
-                            eprintln!("Failed to cycle forward: {}", e);
-                        }
+                        actions.push(InputAction::Forward { minimize_inactive });
                         continue;
                     }
                     if code == snap.backward_key {
-                        if let Err(e) = Self::cycle_backward(&wm, &state, snap.minimize_inactive) {
-                            eprintln!("Failed to cycle backward: {}", e);
-                        }
+                        actions.push(InputAction::Backward { minimize_inactive });
                         continue;
                     }
                 }
@@ -270,11 +262,10 @@ impl KeyboardListener {
                 let target =
                     resolve_character_hotkey(code, &pressed_modifiers, &snap.character_hotkeys);
                 if let Some(name) = target {
-                    if let Err(e) =
-                        Self::switch_to_character(&name, &wm, &state, snap.minimize_inactive)
-                    {
-                        eprintln!("Failed to switch to {}: {}", name, e);
-                    }
+                    actions.push(InputAction::SwitchTo {
+                        name,
+                        minimize_inactive: snap.minimize_inactive,
+                    });
                 }
             }
         }
@@ -317,9 +308,9 @@ impl KeyboardListener {
         for path in event_paths {
             if let Ok(device) = Device::open(&path) {
                 if device.supported_keys().is_some_and(|keys| {
-                    keys.contains(Key::KEY_TAB)
-                        || keys.contains(Key::KEY_LEFTSHIFT)
-                        || keys.contains(Key::KEY_Z)
+                    keys.contains(KeyCode::KEY_TAB)
+                        || keys.contains(KeyCode::KEY_LEFTSHIFT)
+                        || keys.contains(KeyCode::KEY_Z)
                 }) {
                     println!(
                         "Found keyboard device: {} ({})",
@@ -332,52 +323,6 @@ impl KeyboardListener {
         }
 
         anyhow::bail!("No keyboard device found in /dev/input")
-    }
-
-    fn cycle_forward(
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-    ) -> Result<()> {
-        let mut state = state.lock().unwrap();
-        // Skip the get_active_window round-trip during the grace window;
-        // see mouse_listener::run_cycle for the rationale.
-        if !state.in_activation_grace() {
-            if let Ok(active) = wm.get_active_window() {
-                state.sync_with_active(active);
-            }
-        }
-        state.cycle_forward(&**wm, minimize_inactive)?;
-        Ok(())
-    }
-
-    fn cycle_backward(
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-    ) -> Result<()> {
-        let mut state = state.lock().unwrap();
-        if !state.in_activation_grace() {
-            if let Ok(active) = wm.get_active_window() {
-                state.sync_with_active(active);
-            }
-        }
-        state.cycle_backward(&**wm, minimize_inactive)?;
-        Ok(())
-    }
-
-    fn switch_to_character(
-        name: &str,
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-    ) -> Result<()> {
-        let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
-        }
-        state.switch_to_character(name, &**wm, minimize_inactive)?;
-        Ok(())
     }
 }
 

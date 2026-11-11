@@ -25,8 +25,7 @@
 
 use anyhow::{Context, Result};
 use evdev::{
-    uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AttributeSet, EventType, InputEvent, Key, RelativeAxisType,
+    uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode,
 };
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -91,16 +90,16 @@ pub fn schedule_nudge(cell: &OnceLock<Option<PointerNudger>>) {
 }
 
 fn build_device() -> Result<VirtualDevice> {
-    let mut axes = AttributeSet::<RelativeAxisType>::new();
-    axes.insert(RelativeAxisType::REL_X);
-    axes.insert(RelativeAxisType::REL_Y);
+    let mut axes = AttributeSet::<RelativeAxisCode>::new();
+    axes.insert(RelativeAxisCode::REL_X);
+    axes.insert(RelativeAxisCode::REL_Y);
     // A lone BTN_LEFT (never emitted) makes libinput classify the device as
     // a mouse, so its relative motion actually drives the cursor. It carries
     // neither BTN_SIDE nor BTN_EXTRA, so our own mouse listener's autodetect
     // skips it — no feedback loop.
-    let mut keys = AttributeSet::<Key>::new();
-    keys.insert(Key::BTN_LEFT);
-    let device = VirtualDeviceBuilder::new()?
+    let mut keys = AttributeSet::<KeyCode>::new();
+    keys.insert(KeyCode::BTN_LEFT);
+    let device = VirtualDevice::builder()?
         .name(b"nicotine-pointer-nudge")
         .with_keys(&keys)?
         .with_relative_axes(&axes)?
@@ -126,13 +125,13 @@ fn run(mut device: VirtualDevice, rx: Receiver<()>) {
 /// changes the compositor acts on; the cursor returns to the starting pixel.
 fn emit_nudge(device: &mut VirtualDevice) -> std::io::Result<()> {
     device.emit(&[InputEvent::new(
-        EventType::RELATIVE,
-        RelativeAxisType::REL_X.0,
+        EventType::RELATIVE.0,
+        RelativeAxisCode::REL_X.0,
         1,
     )])?;
     device.emit(&[InputEvent::new(
-        EventType::RELATIVE,
-        RelativeAxisType::REL_X.0,
+        EventType::RELATIVE.0,
+        RelativeAxisCode::REL_X.0,
         -1,
     )])?;
     Ok(())
