@@ -70,7 +70,7 @@ rodio = { version = "0.22", default-features = false, features = [
 x11rb = { version = "0.13", features = ["all-extensions"] }
 daemonize = "0.5"
 nix = { version = "0.29", features = ["fs", "poll", "process", "signal"] }
-evdev = "0.12"
+evdev = "0.13"
 # Narrow Wayland-client dep for xdg-activation tokens only. The protocol
 # is how a client hands the Wayland compositor authority to focus another
 # surface — needed to make `nicotine cycle` actually deliver subsequent

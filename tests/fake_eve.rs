@@ -29,7 +29,7 @@ use common::{
     FakeEveHarness, TestDaemon,
 };
 #[cfg(unix)]
-use evdev::Key;
+use evdev::KeyCode;
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -608,7 +608,7 @@ fn per_character_hotkey_activates_target_window() {
     // Build the virtual keyboard BEFORE the daemon so the device
     // node exists when keyboard_listener tries to open it on its
     // first tick. F16 is the key under test (KEY_F16 = 186).
-    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F16, Key::KEY_LEFTSHIFT])
+    let mut vkbd = VirtualInput::keyboard(&[KeyCode::KEY_F16, KeyCode::KEY_LEFTSHIFT])
         .expect("create virtual keyboard");
     let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
 
@@ -644,7 +644,7 @@ vk = 186
     // poll loop opens / re-opens the device on path change.
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    vkbd.tap(Key::KEY_F16).expect("tap F16");
+    vkbd.tap(KeyCode::KEY_F16).expect("tap F16");
     // Daemon's listener -> hotkey planner -> activate is synchronous
     // once the key event arrives, but the WM applies focus a few
     // frames later. 400ms is comfortably above KWin / Mutter latency.
@@ -668,7 +668,8 @@ fn modifier_combo_hotkey_activates_target_window() {
     }
 
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
-    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F1, Key::KEY_LEFTSHIFT]).expect("vkbd");
+    let mut vkbd =
+        VirtualInput::keyboard(&[KeyCode::KEY_F1, KeyCode::KEY_LEFTSHIFT]).expect("vkbd");
     let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
 
     // Bootstrap on Gamma so the test can prove Shift+F1 actually
@@ -701,7 +702,7 @@ modifier = 42
 
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    vkbd.tap_with_modifier(Key::KEY_LEFTSHIFT, Key::KEY_F1)
+    vkbd.tap_with_modifier(KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_F1)
         .expect("Shift+F1");
     std::thread::sleep(std::time::Duration::from_millis(400));
 
@@ -728,7 +729,7 @@ fn mouse_side_button_cycles_forward() {
     // forward button is 276 (BTN_EXTRA on evdev). We register both
     // codes on the virtual mouse so we can also click backward in
     // future tests without rebuilding the device.
-    let mut vmouse = VirtualInput::mouse(&[Key::BTN_SIDE, Key::BTN_EXTRA]).expect("vmouse");
+    let mut vmouse = VirtualInput::mouse(&[KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA]).expect("vmouse");
     let mouse_path = vmouse.devnode().to_string_lossy().into_owned();
 
     activate_window_directly(harness.clients[0].window).expect("bootstrap focus");
@@ -769,7 +770,7 @@ mouse_device_path = \"{mouse_path}\"
     let anchor_pos = post_order.iter().position(|n| n == anchor).unwrap();
     let expected_next = post_order[(anchor_pos + 1) % post_order.len()].clone();
 
-    vmouse.tap(Key::BTN_EXTRA).expect("click BTN_EXTRA");
+    vmouse.tap(KeyCode::BTN_EXTRA).expect("click BTN_EXTRA");
     std::thread::sleep(std::time::Duration::from_millis(400));
 
     let active = daemon.active_client_name().unwrap_or_default();
@@ -795,7 +796,7 @@ fn hotkey_rebind_via_hot_reload_takes_effect() {
     // hot-reload path (the shared KeyboardConfig mutex listener
     // threads read on each poll tick).
     let harness = FakeEveHarness::new(&["Alpha", "Beta", "Gamma"]).expect("harness");
-    let mut vkbd = VirtualInput::keyboard(&[Key::KEY_F16]).expect("vkbd");
+    let mut vkbd = VirtualInput::keyboard(&[KeyCode::KEY_F16]).expect("vkbd");
     let kbd_path = vkbd.devnode().to_string_lossy().into_owned();
     activate_window_directly(harness.clients[0].window).expect("bootstrap");
     let daemon = TestDaemon::spawn().expect("daemon");
@@ -819,7 +820,7 @@ vk = 186
     daemon.rewrite_config(&config_beta).expect("config -> Beta");
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    vkbd.tap(Key::KEY_F16).expect("first F16");
+    vkbd.tap(KeyCode::KEY_F16).expect("first F16");
     std::thread::sleep(std::time::Duration::from_millis(400));
     let after_first = daemon.active_client_name().unwrap_or_default();
     assert_eq!(
@@ -850,7 +851,7 @@ vk = 186
         .expect("config -> Gamma");
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    vkbd.tap(Key::KEY_F16).expect("second F16");
+    vkbd.tap(KeyCode::KEY_F16).expect("second F16");
     std::thread::sleep(std::time::Duration::from_millis(400));
     let after_second = daemon.active_client_name().unwrap_or_default();
     assert_eq!(

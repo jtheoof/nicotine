@@ -26,6 +26,8 @@ mod version_check;
 mod eve_match;
 
 #[cfg(unix)]
+mod input_actions;
+#[cfg(unix)]
 mod keyboard_listener;
 #[cfg(unix)]
 mod mouse_listener;

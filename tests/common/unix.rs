@@ -9,10 +9,7 @@
 //! Cleanup runs on `Drop`: child processes are killed and reaped;
 //! X11 windows go away with the connection.
 
-use evdev::{
-    uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AttributeSet, EventType, InputEvent, Key,
-};
+use evdev::{uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode};
 use nix::libc;
 use nix::sys::prctl;
 use nix::sys::signal::{kill, Signal};
@@ -307,12 +304,12 @@ impl VirtualInput {
     /// Build a virtual keyboard advertising the given key codes. The
     /// path returned by [`Self::devnode`] is what the test's
     /// daemon-config should put in `keyboard_device_path`.
-    pub fn keyboard(keys: &[Key]) -> anyhow::Result<Self> {
-        let mut keyset = AttributeSet::<Key>::new();
+    pub fn keyboard(keys: &[KeyCode]) -> anyhow::Result<Self> {
+        let mut keyset = AttributeSet::<KeyCode>::new();
         for k in keys {
             keyset.insert(*k);
         }
-        let mut dev = VirtualDeviceBuilder::new()?
+        let mut dev = VirtualDevice::builder()?
             .name(b"nicotine-test-vkbd")
             .with_keys(&keyset)?
             .build()?;
@@ -321,15 +318,15 @@ impl VirtualInput {
     }
 
     /// Build a virtual mouse advertising the given button codes (e.g.
-    /// `Key::BTN_SIDE`, `Key::BTN_EXTRA`). Same `devnode` convention
+    /// `KeyCode::BTN_SIDE`, `KeyCode::BTN_EXTRA`). Same `devnode` convention
     /// as `keyboard` — feed it to `mouse_device_path` in the test
     /// config.
-    pub fn mouse(buttons: &[Key]) -> anyhow::Result<Self> {
-        let mut buttonset = AttributeSet::<Key>::new();
+    pub fn mouse(buttons: &[KeyCode]) -> anyhow::Result<Self> {
+        let mut buttonset = AttributeSet::<KeyCode>::new();
         for b in buttons {
             buttonset.insert(*b);
         }
-        let mut dev = VirtualDeviceBuilder::new()?
+        let mut dev = VirtualDevice::builder()?
             .name(b"nicotine-test-vmouse")
             .with_keys(&buttonset)?
             .build()?;
@@ -348,10 +345,10 @@ impl VirtualInput {
     /// Press then release a key. Emits two `EV_KEY` events + the
     /// trailing `EV_SYN` so the evdev consumer treats them as a
     /// single atomic press+release.
-    pub fn tap(&mut self, key: Key) -> anyhow::Result<()> {
+    pub fn tap(&mut self, key: KeyCode) -> anyhow::Result<()> {
         self.dev.emit(&[
-            InputEvent::new(EventType::KEY, key.code(), 1),
-            InputEvent::new(EventType::KEY, key.code(), 0),
+            InputEvent::new(EventType::KEY.0, key.code(), 1),
+            InputEvent::new(EventType::KEY.0, key.code(), 0),
         ])?;
         Ok(())
     }
@@ -359,12 +356,12 @@ impl VirtualInput {
     /// Press `modifier`, tap `key`, release `modifier`. Used for
     /// Shift+F1-style hotkeys where the listener needs to see the
     /// modifier state held across the main key event.
-    pub fn tap_with_modifier(&mut self, modifier: Key, key: Key) -> anyhow::Result<()> {
+    pub fn tap_with_modifier(&mut self, modifier: KeyCode, key: KeyCode) -> anyhow::Result<()> {
         self.dev.emit(&[
-            InputEvent::new(EventType::KEY, modifier.code(), 1),
-            InputEvent::new(EventType::KEY, key.code(), 1),
-            InputEvent::new(EventType::KEY, key.code(), 0),
-            InputEvent::new(EventType::KEY, modifier.code(), 0),
+            InputEvent::new(EventType::KEY.0, modifier.code(), 1),
+            InputEvent::new(EventType::KEY.0, key.code(), 1),
+            InputEvent::new(EventType::KEY.0, key.code(), 0),
+            InputEvent::new(EventType::KEY.0, modifier.code(), 0),
         ])?;
         Ok(())
     }

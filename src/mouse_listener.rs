@@ -18,11 +18,12 @@
 
 use crate::config::Config;
 use crate::cycle_state::CycleState;
+use crate::input_actions::{fetch_bounded, ActionQueue, InputAction};
 use crate::window_manager::WindowManager;
 use anyhow::Result;
-use evdev::{Device, InputEventKind, Key};
+use evdev::{Device, EventType, KeyCode};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +85,9 @@ impl MouseListener {
         // user pinned a specific device by name/path, it's the only
         // entry; in autodetect mode it's every matching event device.
         let mut devices: Vec<Device> = Vec::new();
+        // Cycling runs on a worker so a slow window-manager round-trip
+        // never stalls reading (see `input_actions`).
+        let actions = ActionQueue::spawn("mouse", wm, state);
         let mut current_dev_key: (Option<String>, Option<String>) = (None, None);
         let mut announced_listening = false;
         let mut announced_idle = false;
@@ -153,23 +157,11 @@ impl MouseListener {
                 announced_listening = true;
             }
 
-            // Build the pollfd array. We wrap each device's raw fd in a
-            // BorrowedFd; the fds outlive `pollfds` because we don't
-            // mutate `devices` while pollfds is alive (the borrow
-            // checker doesn't know this — borrow_raw is unsafe — but
-            // the control flow guarantees it).
-            //
-            // SAFETY: each fd belongs to a `Device` in `devices`. We
-            // never drop / remove from `devices` while pollfds is in
-            // scope; we collect ready/dead indices first, drop pollfds,
-            // then act on `devices`.
+            // `pollfds` borrows `devices`; it's dropped (below) before
+            // any device is read or removed.
             let mut pollfds: Vec<PollFd> = devices
                 .iter()
-                .map(|d| {
-                    let raw = d.as_raw_fd();
-                    let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
-                    PollFd::new(borrowed, PollFlags::POLLIN)
-                })
+                .map(|d| PollFd::new(d.as_fd(), PollFlags::POLLIN))
                 .collect();
 
             let n = match poll(&mut pollfds, PollTimeout::from(POLL_TIMEOUT_MS)) {
@@ -189,26 +181,26 @@ impl MouseListener {
             }
 
             // Note which indices are ready vs. hung up. Collect both
-            // BEFORE touching `devices` so pollfds (and its raw-fd
-            // BorrowedFds) can drop first.
+            // BEFORE touching `devices` so pollfds can drop first.
             let mut ready: Vec<usize> = Vec::new();
             let mut dead: Vec<usize> = Vec::new();
             for (i, pfd) in pollfds.iter().enumerate() {
                 let revents = pfd.revents().unwrap_or_else(PollFlags::empty);
                 if revents.contains(PollFlags::POLLIN) {
                     ready.push(i);
-                } else if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+                } else if revents
+                    .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                {
+                    // POLLNVAL too: an fd poll reports but that isn't
+                    // readable would otherwise spin this loop without
+                    // ever sleeping.
                     dead.push(i);
                 }
             }
-            // Now safe to mutate devices.
+            drop(pollfds);
 
             for &i in &ready {
-                // Detach events from the device borrow — Vec<InputEvent>
-                // releases the iterator's reference before we may need
-                // to remove `devices[i]` from the list below.
-                let events_result = devices[i].fetch_events().map(|it| it.collect::<Vec<_>>());
-                let events = match events_result {
+                let events = match fetch_bounded(&mut devices[i]) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!(
@@ -221,11 +213,11 @@ impl MouseListener {
                     }
                 };
                 for event in events {
-                    if let InputEventKind::Key(key) = event.kind() {
+                    if event.event_type() == EventType::KEY {
                         if event.value() != 1 {
                             continue;
                         }
-                        let code = key.code();
+                        let code = event.code();
                         let is_cycle = code == snap.forward_button || code == snap.backward_button;
                         if is_cycle {
                             // Drop a duplicate press echoed by a second device
@@ -235,14 +227,12 @@ impl MouseListener {
                                 continue;
                             }
                             last_cycle = Some(now);
-                            let result = if code == snap.forward_button {
-                                Self::cycle_forward(&wm, &state, snap.minimize_inactive)
+                            let minimize_inactive = snap.minimize_inactive;
+                            actions.push(if code == snap.forward_button {
+                                InputAction::Forward { minimize_inactive }
                             } else {
-                                Self::cycle_backward(&wm, &state, snap.minimize_inactive)
-                            };
-                            if let Err(e) = result {
-                                eprintln!("Failed to cycle: {}", e);
-                            }
+                                InputAction::Backward { minimize_inactive }
+                            });
                         }
                     }
                 }
@@ -344,7 +334,7 @@ impl MouseListener {
         for path in &event_paths {
             if let Ok(device) = Device::open(path) {
                 if device.supported_keys().is_some_and(|keys| {
-                    keys.contains(Key::BTN_SIDE) || keys.contains(Key::BTN_EXTRA)
+                    keys.contains(KeyCode::BTN_SIDE) || keys.contains(KeyCode::BTN_EXTRA)
                 }) {
                     println!(
                         "Listening on mouse device: {} ({})",
@@ -357,45 +347,5 @@ impl MouseListener {
         }
 
         Ok(found)
-    }
-
-    fn cycle_forward(
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-    ) -> Result<()> {
-        Self::run_cycle(wm, state, minimize_inactive, 1)
-    }
-
-    fn cycle_backward(
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-    ) -> Result<()> {
-        Self::run_cycle(wm, state, minimize_inactive, -1)
-    }
-
-    /// Shared lock → (grace-gated) sync-with-active → cycle path for both
-    /// directions. The `get_active_window` round-trip is skipped inside the
-    /// activation grace window, where `sync_with_active` would no-op anyway,
-    /// so it's pure latency on a fast burst.
-    fn run_cycle(
-        wm: &Arc<dyn WindowManager>,
-        state: &Arc<Mutex<CycleState>>,
-        minimize_inactive: bool,
-        step: isize,
-    ) -> Result<()> {
-        let mut state = state.lock().unwrap();
-        if !state.in_activation_grace() {
-            if let Ok(active) = wm.get_active_window() {
-                state.sync_with_active(active);
-            }
-        }
-        if step >= 0 {
-            state.cycle_forward(&**wm, minimize_inactive)?;
-        } else {
-            state.cycle_backward(&**wm, minimize_inactive)?;
-        }
-        Ok(())
     }
 }
