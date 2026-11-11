@@ -310,6 +310,7 @@ impl Daemon {
                     self.config.theme.as_deref(),
                     self.config.preview_colors.as_ref(),
                 ),
+                crate::theme::Theme::named(self.config.theme.as_deref()).panel,
             ) {
                 Ok(()) => return,
                 Err(e) => eprintln!(

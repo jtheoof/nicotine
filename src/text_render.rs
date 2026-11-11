@@ -30,6 +30,7 @@ use swash::FontRef;
 
 const BUNDLED_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 const BUNDLED_FONT_NAME: &str = "JetBrains Mono (bundled)";
+const MARLBORO_FONT: &[u8] = include_bytes!("../assets/fonts/Marlboro.ttf");
 
 /// How glyph coverage is computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,14 @@ impl TextFont {
         Self {
             data: BUNDLED_FONT.to_vec(),
             source: BUNDLED_FONT_NAME.to_string(),
+        }
+    }
+
+    /// The bundled Marlboro logo font ("Nicotine" wordmark).
+    pub fn marlboro() -> Self {
+        Self {
+            data: MARLBORO_FONT.to_vec(),
+            source: "Marlboro (bundled)".to_string(),
         }
     }
 
