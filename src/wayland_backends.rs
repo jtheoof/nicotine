@@ -3,6 +3,8 @@ use crate::pointer_nudge::{schedule_nudge, PointerNudger};
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use x11rb::connection::Connection as _;
@@ -713,6 +715,63 @@ fn run_hyprctl(args: &[String]) -> Result<Vec<u8>> {
     }
 }
 
+/// Socket each Hyprland instance listens on, in
+/// `$XDG_RUNTIME_DIR/hypr/<instance signature>/`.
+const HYPR_SOCKET: &str = ".socket.sock";
+
+/// Does the instance in `instance_dir` accept connections? A crashed or
+/// exited Hyprland leaves its directory and socket file behind, so the
+/// file existing proves nothing.
+fn hypr_instance_live(instance_dir: &Path) -> bool {
+    UnixStream::connect(instance_dir.join(HYPR_SOCKET)).is_ok()
+}
+
+/// The instance hyprctl should use when `current` (the environment's
+/// HYPRLAND_INSTANCE_SIGNATURE) is unset or dead: the live instance in
+/// `hypr_dir` whose socket was created last. `None` when `current` is
+/// live or no instance is, so a working setup is never second-guessed.
+fn replacement_signature(hypr_dir: &Path, current: Option<&str>) -> Option<String> {
+    if current.is_some_and(|sig| hypr_instance_live(&hypr_dir.join(sig))) {
+        return None;
+    }
+    std::fs::read_dir(hypr_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| hypr_instance_live(&entry.path()))
+        .filter_map(|entry| {
+            let created = entry
+                .path()
+                .join(HYPR_SOCKET)
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()?;
+            Some((created, entry.file_name().into_string().ok()?))
+        })
+        .max()
+        .map(|(_, sig)| sig)
+}
+
+/// Point HYPRLAND_INSTANCE_SIGNATURE at a live Hyprland when the
+/// inherited one is stale, e.g. a terminal or multiplexer pane that
+/// outlived the session it was started in. Every hyprctl Nicotine spawns
+/// inherits the fix. Must run before other threads start, since it sets
+/// a process environment variable.
+fn use_live_hyprland_instance() {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let current = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    let hypr_dir = Path::new(&runtime_dir).join("hypr");
+    if let Some(sig) = replacement_signature(&hypr_dir, current.as_deref()) {
+        eprintln!(
+            "HYPRLAND_INSTANCE_SIGNATURE {} is not a running Hyprland; using {sig}",
+            current.as_deref().unwrap_or("(unset)")
+        );
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig);
+    }
+}
+
 pub struct HyprlandManager {
     /// low32 id → full address, refreshed on every enumeration.
     addresses: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
@@ -720,11 +779,12 @@ pub struct HyprlandManager {
 }
 
 impl HyprlandManager {
+    /// Called on the main thread before any other thread starts (see
+    /// `use_live_hyprland_instance`).
     pub fn new() -> Result<Self> {
-        run_hyprctl(&["version".into()]).context(
-            "hyprctl can't reach Hyprland (not running, or a stale \
-             HYPRLAND_INSTANCE_SIGNATURE in this shell?)",
-        )?;
+        use_live_hyprland_instance();
+        run_hyprctl(&["version".into()])
+            .context("hyprctl can't reach Hyprland (is it running in this session?)")?;
         // `eval` exists only on Lua-config Hyprland (0.57+), where it
         // replies "ok"; older builds reject it as an unknown request.
         let syntax = match run_hyprctl(&["eval".into(), "return 1".into()]) {
@@ -1128,6 +1188,74 @@ impl WindowManager for GnomeManager {
 #[cfg(test)]
 mod hyprland_tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    /// A fake `$XDG_RUNTIME_DIR/hypr`, removed on drop. Kept short: a
+    /// Unix socket path must fit in 108 bytes.
+    struct HyprDir(PathBuf);
+
+    impl HyprDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("nh-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// A live instance: its socket accepts connections while the
+        /// returned listener lives.
+        fn live(&self, sig: &str) -> UnixListener {
+            let dir = self.0.join(sig);
+            std::fs::create_dir_all(&dir).unwrap();
+            UnixListener::bind(dir.join(HYPR_SOCKET)).unwrap()
+        }
+
+        /// A dead instance: the socket file is left behind with nothing
+        /// listening, as after a crash or logout.
+        fn dead(&self, sig: &str) {
+            drop(self.live(sig));
+        }
+    }
+
+    impl Drop for HyprDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stale_signature_falls_back_to_newest_live_instance() {
+        let hypr = HyprDir::new("fallback");
+        hypr.dead("dead");
+        let _older = hypr.live("older");
+        // Socket mtimes order the instances; keep them apart.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _newer = hypr.live("newer");
+        std::fs::create_dir_all(hypr.0.join("nosocket")).unwrap();
+
+        for current in [Some("dead"), Some("missing"), None] {
+            assert_eq!(
+                replacement_signature(&hypr.0, current).as_deref(),
+                Some("newer"),
+                "current = {current:?}"
+            );
+        }
+        // A live signature is kept even when it isn't the newest one.
+        assert_eq!(replacement_signature(&hypr.0, Some("older")), None);
+    }
+
+    #[test]
+    fn no_live_instance_leaves_signature_alone() {
+        let hypr = HyprDir::new("none");
+        hypr.dead("dead");
+        assert_eq!(replacement_signature(&hypr.0, Some("dead")), None);
+        assert_eq!(replacement_signature(&hypr.0, None), None);
+        assert_eq!(
+            replacement_signature(&hypr.0.join("does-not-exist"), None),
+            None
+        );
+    }
 
     #[test]
     fn parses_full_64_bit_address() {
