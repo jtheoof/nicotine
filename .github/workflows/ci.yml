@@ -236,14 +236,16 @@ jobs:
           SWAY_PID=$!
 
           # Wait for sway's Wayland socket to appear. Sway names it
-          # `wayland-N`; we pick the first one that shows up.
+          # `wayland-N` (next to a `wayland-N.lock` file); we pick the
+          # first actual socket that shows up.
           WAYLAND_SOCK=""
           for _ in $(seq 1 50); do
-            WAYLAND_SOCK=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null \
-              | grep -E '^wayland-[0-9]+$' | head -1 || true)
-            if [ -n "$WAYLAND_SOCK" ]; then
-              break
-            fi
+            for f in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+              if [ -S "$f" ]; then
+                WAYLAND_SOCK=${f##*/}
+                break 2
+              fi
+            done
             sleep 0.1
           done
 

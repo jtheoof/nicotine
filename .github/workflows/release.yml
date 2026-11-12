@@ -56,8 +56,8 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
-          mv Nicotine nicotine-linux-${ARCH}
-          chmod +x nicotine-linux-${ARCH}
+          mv Nicotine "nicotine-linux-${ARCH}"
+          chmod +x "nicotine-linux-${ARCH}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
