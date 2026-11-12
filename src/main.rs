@@ -262,7 +262,10 @@ fn stop_command() {
     let _ = std::fs::remove_file(paths::lock_file_path());
 }
 
-fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -> Result<()> {
+/// Fallback cycle when no daemon answers IPC: a one-shot window manager
+/// does the switch in this process.
+fn run_cycle_direct(config: &Config, op: CycleOp) -> Result<()> {
+    let wm = create_window_manager()?;
     let windows = wm.get_eve_windows()?;
     if windows.is_empty() {
         return Ok(());
@@ -283,12 +286,12 @@ fn run_cycle_direct(wm: &Arc<dyn WindowManager>, config: &Config, op: CycleOp) -
     }
 
     match op {
-        CycleOp::Forward => state.cycle_forward(&**wm, config.minimize_inactive)?,
-        CycleOp::Backward => state.cycle_backward(&**wm, config.minimize_inactive)?,
+        CycleOp::Forward => state.cycle_forward(&*wm, config.minimize_inactive)?,
+        CycleOp::Backward => state.cycle_backward(&*wm, config.minimize_inactive)?,
         CycleOp::Switch(target) => {
             state.switch_to(
                 target,
-                &**wm,
+                &*wm,
                 config.minimize_inactive,
                 character_order.as_deref(),
             )?;
@@ -319,18 +322,23 @@ fn main() -> Result<()> {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     let config = Config::load()?;
-    let wm = create_window_manager()?;
 
+    // The window manager is built only by the commands that use it.
+    // Connecting to the compositor can fail (e.g. a stale
+    // HYPRLAND_INSTANCE_SIGNATURE), and that must not break `stop`,
+    // `init-config` or the cycle commands, which normally just message
+    // the daemon. It also keeps those commands' hot path free of
+    // compositor round-trips.
     match command {
         "start" => {
             println!("Starting Nicotine 🚬");
-            start_command(wm, config)?;
+            start_command(create_window_manager()?, config)?;
         }
 
         "daemon" => {
             println!("Starting Nicotine daemon...");
             let live = LiveSettings::from_config(&config);
-            let mut daemon = Daemon::new(wm, config, live);
+            let mut daemon = Daemon::new(create_window_manager()?, config, live);
             daemon.run()?;
         }
 
@@ -342,7 +350,7 @@ fn main() -> Result<()> {
             // the entry point fake-EVE integration tests use to verify
             // the enumeration + filter pipeline end-to-end without
             // booting the real game.
-            let windows = wm.get_eve_windows()?;
+            let windows = create_window_manager()?.get_eve_windows()?;
             for w in &windows {
                 println!("{}\t{}", w.id, w.title);
             }
@@ -354,6 +362,7 @@ fn main() -> Result<()> {
             // the focused window isn't an EVE client. Integration
             // tests rely on this to assert that cycle / switch
             // operations changed focus to the expected client.
+            let wm = create_window_manager()?;
             let active = wm.get_active_window().unwrap_or(0);
             if active != 0 {
                 let windows = wm.get_eve_windows()?;
@@ -365,6 +374,7 @@ fn main() -> Result<()> {
 
         "stack" => {
             println!("Stacking EVE windows...");
+            let wm = create_window_manager()?;
             let windows = wm.get_eve_windows()?;
 
             println!(
@@ -385,14 +395,14 @@ fn main() -> Result<()> {
             if daemon::send_command("forward").is_ok() {
                 return Ok(());
             }
-            lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Forward))?;
+            lock::with_cycle_lock(|| run_cycle_direct(&config, CycleOp::Forward))?;
         }
 
         "cycle-backward" | "backward" | "b" => {
             if daemon::send_command("backward").is_ok() {
                 return Ok(());
             }
-            lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Backward))?;
+            lock::with_cycle_lock(|| run_cycle_direct(&config, CycleOp::Backward))?;
         }
 
         "stop" => {
@@ -409,7 +419,7 @@ fn main() -> Result<()> {
         // this matches a double-click from Explorer; on Linux it matches
         // launching from a `.desktop` entry where no args are passed.
         "" => {
-            start_command(wm, config)?;
+            start_command(create_window_manager()?, config)?;
         }
 
         // Handle switch command or numeric shorthand
@@ -426,7 +436,7 @@ fn main() -> Result<()> {
                 if daemon::send_command(&format!("switch:{}", target)).is_ok() {
                     return Ok(());
                 }
-                lock::with_cycle_lock(|| run_cycle_direct(&wm, &config, CycleOp::Switch(target)))?;
+                lock::with_cycle_lock(|| run_cycle_direct(&config, CycleOp::Switch(target)))?;
             } else {
                 println!();
                 println!("🚬 N I C O T I N E 🚬");
