@@ -1,13 +1,14 @@
 # `cross` runs the build inside an isolated Docker container.
 #
-# rodio/cpal link ALSA on Linux, so the container needs ALSA's dev package
-# (alsa.pc + libasound) for the *target* architecture before the crate
-# compiles. `$CROSS_DEB_ARCH` is the Debian arch cross is building for
-# (amd64 / arm64), so this single block covers both Linux release targets.
+# rodio/cpal link ALSA on Linux, and the Wayland preview backend links
+# libgbm (mesa) for dmabuf capture buffers, so the container needs both
+# dev packages for the *target* architecture before the crate links.
+# `$CROSS_DEB_ARCH` is the Debian arch cross is building for (amd64 /
+# arm64), so this single block covers both Linux release targets.
 [build]
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get --assume-yes install pkg-config libasound2-dev:$CROSS_DEB_ARCH",
+    "apt-get update && apt-get --assume-yes install pkg-config libasound2-dev:$CROSS_DEB_ARCH libgbm-dev:$CROSS_DEB_ARCH",
 ]
 
 # Env vars that build scripts need (here: `option_env!` for the telemetry
