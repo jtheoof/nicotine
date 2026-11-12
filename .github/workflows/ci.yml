@@ -3,10 +3,11 @@ name: CI
 on:
   push:
     branches:
-      - master
+      - '**'
   pull_request:
     branches:
       - master
+  workflow_dispatch:
 
 jobs:
   test:
@@ -19,9 +20,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Caches ~/.cargo and target/ keyed on Cargo.lock + toolchain;
+      # iced/wgpu make cold builds slow.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       # rodio/cpal link ALSA on Linux; alsa-sys needs alsa.pc at build time.
-      - name: Install ALSA dev
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      # The Wayland preview backend links libgbm for dmabuf buffers.
+      - name: Install ALSA + GBM dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgbm-dev pkg-config
 
       - name: Run tests
         run: cargo test --verbose
@@ -43,6 +50,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
+      # Caches ~/.cargo and target/ keyed on Cargo.lock + toolchain;
+      # iced/wgpu make cold builds slow.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
 
       # cargo-xwin invokes `clang-cl` (provided by the `clang` package; it
       # symlinks to `clang` and switches to MSVC mode based on argv[0]).
@@ -77,6 +89,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Caches ~/.cargo and target/ keyed on Cargo.lock + toolchain;
+      # iced/wgpu make cold builds slow.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       # Xvfb gives us a headless X server; openbox is a tiny EWMH-
       # compliant WM that publishes _NET_CLIENT_LIST and honors
       # _NET_ACTIVE_WINDOW ClientMessages — enough for the
@@ -84,12 +101,12 @@ jobs:
       # wmctrl is a runtime dep of nicotine's KWinManager (called
       # via shell), and the GL stack (libgl) is needed because
       # eframe links against it even for headless test builds.
-      - name: Install X11 + WM + GL + ALSA deps
+      - name: Install X11 + WM + GL + ALSA + GBM deps
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb openbox wmctrl \
             libxkbcommon-x11-0 libgl1 libwayland-client0 \
-            libasound2-dev pkg-config
+            libasound2-dev libgbm-dev pkg-config
 
       # Phase 3 input-simulation tests create uinput virtual
       # keyboards / mice through /dev/uinput. Two pieces of access
@@ -139,6 +156,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Caches ~/.cargo and target/ keyed on Cargo.lock + toolchain;
+      # iced/wgpu make cold builds slow.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       # Run the bin's unit tests on Windows too — some of them are
       # `#[cfg(windows)]` and validate Win32 behavior (e.g. that
       # OEM VKs translate to layout characters via MapVirtualKeyW
@@ -166,6 +188,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Caches ~/.cargo and target/ keyed on Cargo.lock + toolchain;
+      # iced/wgpu make cold builds slow.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       # Sway is a tiling Wayland compositor (wlroots-based) that has
       # advertised `xdg_activation_v1` since 1.7. The `weston`
       # ubuntu-latest ships doesn't expose it via the headless
@@ -175,10 +202,10 @@ jobs:
       # Catches the class of regression we'd hit if a
       # `wayland-client` version bump or protocol-schema change
       # broke our dispatch loop / token extraction.
-      - name: Install Sway + ALSA dev
+      - name: Install Sway + ALSA + GBM dev
         run: |
           sudo apt-get update
-          sudo apt-get install -y sway libasound2-dev pkg-config
+          sudo apt-get install -y sway libasound2-dev libgbm-dev pkg-config
 
       - name: Start Sway (headless) and run xdg_activation test
         run: |
