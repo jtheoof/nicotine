@@ -1,9 +1,11 @@
 name: CI
 
 on:
+  # Feature branches get CI through their pull_request event; also
+  # triggering on every branch push would run each PR's CI twice.
   push:
     branches:
-      - '**'
+      - master
   pull_request:
     branches:
       - master
@@ -15,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -66,7 +68,7 @@ jobs:
       # The xwin SDK download is several hundred MB — cache it across
       # CI runs so we only pay the cost on the first run after a key bust.
       - name: Cache xwin SDK
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-ubuntu-latest-v1
@@ -84,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -151,7 +153,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -183,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -15,7 +15,7 @@ jobs:
     name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compare versions
         run: |
           CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,7 +60,7 @@ jobs:
           chmod +x nicotine-linux-${ARCH}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nicotine-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/nicotine-linux-*
@@ -72,7 +72,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
       # The xwin SDK download is several hundred MB — cache it across
       # CI runs so we only pay the cost on the first run after a key bust.
       - name: Cache xwin SDK
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-ubuntu-latest-v1
@@ -105,7 +105,7 @@ jobs:
         run: cargo xwin build --release --target x86_64-pc-windows-msvc
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nicotine-x86_64-pc-windows-msvc
           path: target/x86_64-pc-windows-msvc/release/Nicotine.exe
@@ -119,15 +119,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Create release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           # Hardcoded for the v0.4.x Windows-port series. Edit / parameterize
           # when shipping a release with a different theme.
