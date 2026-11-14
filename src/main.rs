@@ -61,6 +61,7 @@ use cycle_state::CycleState;
 use daemon::Daemon;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use window_manager::WindowManager;
 
 #[cfg(unix)]
@@ -235,6 +236,32 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Ask an already-running Nicotine to show its panel (e.g. one closed to
+/// the tray). True if its panel took the request, in which case this
+/// launch has nothing left to do. A headless daemon, an older version, or
+/// one that doesn't answer in time means: start a panel here as before.
+fn reopen_running_panel() -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ipc::request("show"));
+    });
+    matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Ok(reply)) if reply == "ok"
+    )
+}
+
+/// `nicotine start` / no-argument launch: reuse a running instance's panel
+/// if there is one, otherwise start the daemon and panel.
+fn launch(config: Config) -> Result<()> {
+    if reopen_running_panel() {
+        println!("Nicotine is already running; showing its window");
+        return Ok(());
+    }
+    println!("Starting Nicotine 🚬");
+    start_command(create_window_manager()?, config)
+}
+
 #[cfg(unix)]
 fn stop_command() {
     // pkill matches against `comm` (the kernel's short process name)
@@ -333,8 +360,7 @@ fn main() -> Result<()> {
     // compositor round-trips.
     match command {
         "start" => {
-            println!("Starting Nicotine 🚬");
-            start_command(create_window_manager()?, config)?;
+            launch(config)?;
         }
 
         "daemon" => {
@@ -421,7 +447,7 @@ fn main() -> Result<()> {
         // this matches a double-click from Explorer; on Linux it matches
         // launching from a `.desktop` entry where no args are passed.
         "" => {
-            start_command(create_window_manager()?, config)?;
+            launch(config)?;
         }
 
         // Handle switch command or numeric shorthand

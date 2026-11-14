@@ -17,7 +17,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -236,6 +236,17 @@ impl TestDaemon {
         Err(last_err.unwrap_or_else(|| {
             anyhow::anyhow!("send {command:?} timed out with no error captured")
         }))
+    }
+
+    /// Send a command and return the daemon's one-line reply (empty if
+    /// it closes the connection without answering).
+    pub fn request(&self, command: &str) -> anyhow::Result<String> {
+        let mut stream = try_connect(&self.socket_printname)?;
+        writeln!(stream, "{}", command)?;
+        stream.flush()?;
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply)?;
+        Ok(reply.trim().to_string())
     }
 
     /// Run `Nicotine <args>` against this daemon (env vars pinned to
