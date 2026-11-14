@@ -1193,3 +1193,27 @@ fn single_eve_cycle_is_a_no_op() {
         active
     );
 }
+
+#[test]
+#[ignore = "requires DISPLAY + a window manager that publishes _NET_CLIENT_LIST"]
+fn show_on_headless_daemon_reports_no_panel() {
+    if skip_if_no_display() {
+        return;
+    }
+
+    // A relaunched `nicotine start` sends "show" and only exits if a
+    // running panel took it. A headless daemon has no panel, so it must
+    // answer "no-panel" (and the launcher then opens its own panel).
+    let _harness = FakeEveHarness::new(&["Solo"]).expect("harness");
+    let daemon = TestDaemon::spawn().expect("daemon");
+
+    let reply = daemon.request("show").expect("show request");
+    assert_eq!(reply, "no-panel");
+
+    // Daemon still responsive afterwards.
+    let after_list = daemon.nicotine_stdout(&["list"]);
+    assert!(
+        names_from_list_output(&after_list).contains("Solo"),
+        "daemon should still see Solo after a show request:\n{after_list}"
+    );
+}

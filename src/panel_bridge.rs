@@ -1,5 +1,6 @@
 //! Requests to the config panel from outside its iced runtime: the tray
-//! icon's menu (on the tray's own thread).
+//! icon's menu (on the tray's own thread) and the daemon's `show` IPC
+//! command (sent when Nicotine is launched again while running).
 //!
 //! The panel installs the channel when it starts and drains it through an
 //! iced subscription, so requests run through its normal update logic

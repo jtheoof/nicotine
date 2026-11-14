@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions, Stream,
 };
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 
 #[cfg(unix)]
 const DEFAULT_SOCKET_PRINTNAME: &str = "/tmp/nicotine.sock";
@@ -53,6 +53,20 @@ pub fn send_line(message: &str) -> Result<()> {
     writeln!(stream, "{}", message)?;
     stream.flush()?;
     Ok(())
+}
+
+/// Send a command and wait for the daemon's one-line reply. A daemon that
+/// doesn't answer this command just closes the connection, which reads as
+/// an empty reply.
+pub fn request(message: &str) -> Result<String> {
+    let name = socket_name()?;
+    let mut stream =
+        Stream::connect(name).context("Failed to connect to nicotine daemon — is it running?")?;
+    writeln!(stream, "{}", message)?;
+    stream.flush()?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply.trim().to_string())
 }
 
 #[allow(dead_code)]

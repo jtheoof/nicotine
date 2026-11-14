@@ -9,7 +9,7 @@ use crate::telemetry;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
 use interprocess::local_socket::traits::ListenerExt as _;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -19,6 +19,9 @@ pub enum Command {
     Switch(usize),
     Refresh,
     Stack,
+    /// Show the config panel; replies "ok" when a panel in this process
+    /// took the request, "no-panel" when the daemon runs headless.
+    Show,
     Quit,
 }
 
@@ -30,6 +33,7 @@ impl Command {
             "backward" => Some(Command::Backward),
             "refresh" => Some(Command::Refresh),
             "stack" => Some(Command::Stack),
+            "show" => Some(Command::Show),
             "quit" => Some(Command::Quit),
             _ => {
                 // Check for switch:N format
@@ -417,6 +421,11 @@ impl Daemon {
                         eprintln!("Restack failed: {}", e);
                     }
                 }
+                Command::Show => {
+                    let shown = crate::panel_bridge::request(crate::panel_bridge::UiRequest::Open);
+                    let reply = if shown { "ok" } else { "no-panel" };
+                    writeln!(reader.get_mut(), "{reply}")?;
+                }
                 Command::Quit => {
                     std::process::exit(0);
                 }
@@ -429,4 +438,23 @@ impl Daemon {
 
 pub fn send_command(command: &str) -> Result<()> {
     ipc::send_line(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_show_command() {
+        assert!(matches!(Command::from_str("show\n"), Some(Command::Show)));
+    }
+
+    #[test]
+    fn show_without_a_panel_is_not_handled() {
+        // No panel in the test process, so a `show` must report "no-panel"
+        // and the launcher falls back to starting its own panel.
+        assert!(!crate::panel_bridge::request(
+            crate::panel_bridge::UiRequest::Open
+        ));
+    }
 }
