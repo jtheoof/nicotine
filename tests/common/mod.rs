@@ -29,37 +29,20 @@ use interprocess::local_socket::GenericNamespaced;
 use interprocess::local_socket::{prelude::*, Stream};
 
 /// Path to the built `Nicotine` binary corresponding to this test
-/// run. Cargo puts the bin next to the test binaries (sometimes one
-/// level up in `deps/`); this resolves either layout. On Windows the
-/// executable has a `.exe` suffix; Cargo + std `Command` handle the
-/// extension transparently when invoking, but we need the exact path
-/// for the `bin/` resolution.
+/// run. Cargo sets `CARGO_BIN_EXE_<name>` for integration tests to the
+/// exact path of each bin target (including `.exe` on Windows), so we
+/// never guess the target-dir layout: deriving it from `current_exe()`
+/// broke when Cargo 1.100 moved test binaries out of `target/<profile>/deps`.
 pub fn nicotine_binary() -> PathBuf {
-    locate_bin("Nicotine")
+    PathBuf::from(env!("CARGO_BIN_EXE_Nicotine"))
 }
 
 /// Path to the built `fake-eve-stub` test helper binary. Only used by
-/// the Windows fake-EVE harness, but the locator is cross-platform
-/// because Cargo builds the bin on every host (the stub itself is a
-/// no-op on non-Windows).
+/// the Windows fake-EVE harness, but Cargo builds the bin on every
+/// host (the stub itself is a no-op on non-Windows).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn fake_eve_stub_binary() -> PathBuf {
-    locate_bin("fake-eve-stub")
-}
-
-fn locate_bin(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // strip the test binary name
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    let mut bin = path.join(name);
-    // Windows binaries have a `.exe` extension; std::process::Command
-    // resolves with or without it but Path::is_file does not.
-    if cfg!(windows) && !bin.exists() {
-        bin.set_extension("exe");
-    }
-    bin
+    PathBuf::from(env!("CARGO_BIN_EXE_fake-eve-stub"))
 }
 
 /// Skip-with-message helper. Returns true if the test should be
