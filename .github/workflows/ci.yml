@@ -32,8 +32,12 @@ jobs:
       - name: Install ALSA + GBM dev
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgbm-dev pkg-config
 
+      # --locked fails the job if Cargo.lock is stale (e.g. a version
+      # bump in Cargo.toml without the matching lock update) instead of
+      # silently regenerating it, so packagers building with --locked
+      # don't hit it first.
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Check formatting
         run: cargo fmt --check
