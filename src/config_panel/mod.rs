@@ -245,6 +245,11 @@ pub(super) struct Panel {
     /// The panel window while it's open. The iced runtime runs as a
     /// daemon, so it outlives the window; `None` means no window is open.
     pub window: Option<iced::window::Id>,
+    /// The tray icon while `config.close_to_tray` is on and a tray exists.
+    /// Closing the window keeps Nicotine running only while this is up.
+    pub tray: Option<crate::tray::Tray>,
+    /// Why the tray icon couldn't be shown, for the panel to explain.
+    pub tray_error: Option<String>,
 }
 
 impl Panel {
@@ -293,6 +298,8 @@ impl Panel {
             version_polls: 0,
             outputs_polls: 0,
             window: None,
+            tray: None,
+            tray_error: None,
         }
     }
 
@@ -300,6 +307,39 @@ impl Panel {
     /// once the user goes idle.
     pub(super) fn touch(&mut self) {
         self.last_change = Some(Instant::now());
+    }
+
+    /// Show or remove the tray icon to match `config.close_to_tray`.
+    fn sync_tray(&mut self) {
+        if !self.config.close_to_tray {
+            self.tray = None;
+            self.tray_error = None;
+            return;
+        }
+        if self.tray.is_none() {
+            match crate::tray::spawn(Arc::clone(&self.live), self.restack_supported) {
+                Ok(tray) => {
+                    self.tray = Some(tray);
+                    self.tray_error = None;
+                }
+                Err(e) => {
+                    eprintln!("tray icon unavailable: {e}");
+                    self.tray_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// Open the panel window, or focus it if it's already open.
+    fn open_window(&mut self) -> Task<Message> {
+        match self.window {
+            Some(id) => iced::window::gain_focus(id),
+            None => {
+                let (id, open) = iced::window::open(window_settings(&self.config));
+                self.window = Some(id);
+                open.discard()
+            }
+        }
     }
 
     /// Write an edit still waiting on the autosave debounce, so it isn't
@@ -441,6 +481,10 @@ pub(super) enum Message {
     OutputsPoll,
     WindowResized(u32, u32),
     CloseRequested(iced::window::Id),
+    CloseToTrayToggled(bool),
+    StartInTrayToggled(bool),
+    /// A request from outside the runtime (tray menu), via `panel_bridge`.
+    Ui(crate::panel_bridge::UiRequest),
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -600,6 +644,7 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::ShowPreviewsToggled(v) => {
             panel.config.show_previews = v;
             panel.live.lock().unwrap().show_previews = v;
+            crate::tray::refresh();
             panel.touch();
         }
         Message::HideActivePreviewToggled(v) => {
@@ -726,14 +771,43 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.touch();
             }
         }
-        Message::CloseRequested(_id) => {
+        Message::CloseRequested(id) => {
             // The window is closing — flush a pending edit (e.g. a resize made
-            // within the autosave debounce) before we exit, so it isn't lost.
-            // The window opens with `exit_on_close_request: false` so we
-            // control teardown; `exit()` then ends the runtime (and tears the
-            // window down).
+            // within the autosave debounce) so it isn't lost. The window opens
+            // with `exit_on_close_request: false` so we control teardown: with
+            // a tray icon up, only the window closes and Nicotine keeps
+            // running; otherwise `exit()` ends the runtime.
             panel.flush_pending_save();
+            if panel.tray.is_some() {
+                panel.window = None;
+                return iced::window::close(id);
+            }
             return iced::exit();
+        }
+        Message::CloseToTrayToggled(v) => {
+            panel.config.close_to_tray = v;
+            panel.sync_tray();
+            panel.touch();
+        }
+        Message::StartInTrayToggled(v) => {
+            panel.config.start_in_tray = v;
+            panel.touch();
+        }
+        Message::Ui(request) => {
+            use crate::panel_bridge::UiRequest;
+            match request {
+                UiRequest::Open => return panel.open_window(),
+                UiRequest::TogglePreviews => {
+                    // Read the live flag: the toggle hotkey may have flipped
+                    // it without the panel's config catching up yet.
+                    let show = !panel.live.lock().unwrap().show_previews;
+                    return update(panel, Message::ShowPreviewsToggled(show));
+                }
+                UiRequest::Quit => {
+                    panel.flush_pending_save();
+                    return iced::exit();
+                }
+            }
         }
     }
     Task::none()
@@ -819,6 +893,8 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
     // Save-on-close: flush a just-made resize the debounce hasn't written yet.
     // Paired with `exit_on_close_request: false` in `window_settings`.
     subs.push(iced::window::close_requests().map(Message::CloseRequested));
+    // Tray menu requests (see `panel_bridge`).
+    subs.push(Subscription::run(crate::panel_bridge::requests).map(Message::Ui));
     Subscription::batch(subs)
 }
 
@@ -1240,18 +1316,26 @@ fn window_settings(config: &Config) -> iced::window::Settings {
 /// instantly.
 ///
 /// The iced runtime runs as a daemon: it doesn't exit when its last window
-/// closes, and the panel window is opened explicitly at boot. Closing the
-/// window still quits (see `Message::CloseRequested`).
+/// closes, so with "close to tray" on, Nicotine keeps running behind its
+/// tray icon (see `Message::CloseRequested`). The panel window is opened
+/// explicitly at boot, unless "start in tray" says to start hidden.
 pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     let audio = crate::audio::spawn();
     let _ = PALETTE.set(crate::theme::Theme::named(config.theme.as_deref()).panel);
+    crate::panel_bridge::install();
 
     iced::daemon(
         move || {
             let mut panel = Panel::new(config.clone(), Arc::clone(&live), audio.clone());
-            let (id, open) = iced::window::open(window_settings(&panel.config));
-            panel.window = Some(id);
-            (panel, open.discard())
+            panel.sync_tray();
+            // Start hidden only if the tray actually came up, so there's
+            // always a way back to the panel.
+            let open = if panel.tray.is_some() && panel.config.start_in_tray {
+                Task::none()
+            } else {
+                panel.open_window()
+            };
+            (panel, open)
         },
         update,
         view,

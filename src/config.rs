@@ -215,6 +215,15 @@ pub struct Config {
     /// follows it if the client moves. Linux Wayland previews only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_output: Option<String>,
+    /// Keep Nicotine running with a tray icon when the panel window is
+    /// closed, instead of quitting. Needs a system tray (on Linux, a
+    /// StatusNotifierItem host); without one, closing quits as before.
+    #[serde(default)]
+    pub close_to_tray: bool,
+    /// With `close_to_tray`, start with only the tray icon and no panel
+    /// window (e.g. for autostart).
+    #[serde(default)]
+    pub start_in_tray: bool,
 }
 
 /// `[preview_colors]` table: optional "#RRGGBB" overrides for the preview
@@ -479,6 +488,8 @@ impl Config {
             theme: None,
             preview_colors: None,
             preview_output: None,
+            close_to_tray: false,
+            start_in_tray: false,
         }
     }
 
@@ -544,6 +555,8 @@ mod tests {
             theme: None,
             preview_colors: None,
             preview_output: None,
+            close_to_tray: false,
+            start_in_tray: false,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -589,6 +602,8 @@ mod tests {
             theme: None,
             preview_colors: None,
             preview_output: None,
+            close_to_tray: false,
+            start_in_tray: false,
             eve_width: 1000,
             eve_height: 1080,
             enable_mouse_buttons: true,
@@ -633,6 +648,8 @@ mod tests {
             theme: None,
             preview_colors: None,
             preview_output: None,
+            close_to_tray: false,
+            start_in_tray: false,
             eve_width: 4147,
             eve_height: 2160,
             enable_mouse_buttons: true,

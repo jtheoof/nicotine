@@ -1,6 +1,7 @@
-// Build script: generate a multi-size Windows ICO from assets/icon.png
-// and embed it as the executable's icon resource so Explorer shows the
-// Nicotine logo on nicotine.exe. Only runs when the target is Windows.
+// Build script: rasterize assets/icon.png for the system tray icon (all
+// targets), and on Windows generate a multi-size ICO from it and embed it
+// as the executable's icon resource so Explorer shows the Nicotine logo
+// on nicotine.exe.
 //
 // We do the PNG→ICO conversion in Rust (image + ico crates) so there's
 // no external image tool required on the host. For the .res compile we
@@ -16,12 +17,14 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=build.rs");
 
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    generate_tray_icons(&out_dir);
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "windows" {
         return;
     }
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let ico_path = out_dir.join("nicotine.ico");
     generate_ico(&ico_path);
 
@@ -38,6 +41,24 @@ fn main() {
                 e
             );
         }
+    }
+}
+
+/// Write `tray-<size>.rgba`: the logo as raw RGBA, fitted (aspect ratio
+/// kept) and centred in a transparent square, which is what tray hosts
+/// expect. Decoding at build time keeps a PNG decoder out of the binary.
+fn generate_tray_icons(out_dir: &Path) {
+    let img = image::load_from_memory(include_bytes!("assets/icon.png")).expect("decode icon.png");
+    for size in [32u32, 64] {
+        let fitted = img
+            .resize(size, size, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
+        let mut square = image::RgbaImage::new(size, size);
+        let x = (size - fitted.width()) / 2;
+        let y = (size - fitted.height()) / 2;
+        image::imageops::overlay(&mut square, &fitted, x.into(), y.into());
+        std::fs::write(out_dir.join(format!("tray-{size}.rgba")), square.into_raw())
+            .expect("write tray icon");
     }
 }
 

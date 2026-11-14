@@ -167,9 +167,13 @@ pub(super) fn vdivider() -> Element<'static, Message> {
 
 pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
     let inner: Element<'_, Message> = match panel.active_tab {
-        Tab::Display => column![display_mode_section(panel), previews_section(panel)]
-            .spacing(20)
-            .into(),
+        Tab::Display => column![
+            display_mode_section(panel),
+            previews_section(panel),
+            tray_section(panel),
+        ]
+        .spacing(20)
+        .into(),
         Tab::Characters => characters_section(panel),
         Tab::Hotkeys => hotkeys_section(panel),
     };
@@ -653,4 +657,42 @@ fn bind_button(
             }
         })
         .into()
+}
+
+fn tray_section(panel: &Panel) -> Element<'_, Message> {
+    let mut col = column![
+        section_header("System Tray"),
+        checkbox(panel.config.close_to_tray)
+            .label("Keep running in the tray when the window is closed")
+            .on_toggle(Message::CloseToTrayToggled),
+        checkbox(panel.config.start_in_tray)
+            .label("Start hidden in the tray")
+            .on_toggle_maybe(
+                panel
+                    .config
+                    .close_to_tray
+                    .then_some(Message::StartInTrayToggled),
+            ),
+    ]
+    .spacing(8);
+
+    if let Some(err) = &panel.tray_error {
+        col = col.push(
+            text(format!(
+                "Tray icon unavailable ({err}), so closing the window still quits Nicotine."
+            ))
+            .size(CAPTION_SIZE)
+            .color(color(palette().danger)),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        col = col.push(caption(
+            "Needs a desktop tray: KDE Plasma, the tray module of waybar (Hyprland, Sway), or \
+             GNOME with the AppIndicator extension. Without one, closing the window quits.",
+        ));
+    }
+
+    col.into()
 }

@@ -25,6 +25,7 @@ High-performance EVE Online multiboxing tool for Linux (X11 & Wayland) and Windo
 - **Drag-to-position with snap-to-dock** on previews and the list window; lockable layout for play
 - **Multi-compositor support** — X11, KDE Plasma (Wayland), Sway, Hyprland, GNOME (Wayland; auto-stack excepted)
 - **Minimize inactive clients** — optional, reduces resource usage when cycling away
+- **System tray** — optional: closing the panel keeps Nicotine running behind a tray icon (Open, show/hide previews, restack, quit)
 
 ## Roadmap
 - Comprehensive documentation
@@ -185,6 +186,8 @@ Previews and the list window:
 - **Click without drag** on a preview to foreground that EVE client
 - **Lock positions** in the panel to freeze the layout during play
 
+With **Keep running in the tray** on (Display tab → System Tray), closing the panel leaves Nicotine running behind a tray icon; click the icon to reopen the panel, or right-click it to show/hide previews, restack or quit. **Start hidden in the tray** skips the panel at launch, which suits autostart. On Linux the icon needs a StatusNotifierItem tray: KDE Plasma, waybar's `tray` module (Hyprland, Sway), or GNOME with the AppIndicator extension. Without one, closing the panel quits as usual.
+
 ## Configuration
 
 Config file: `~/.config/nicotine/config.toml`
@@ -206,6 +209,8 @@ enable_mouse_buttons = true
 forward_button = 276       # Button 9
 backward_button = 275      # Button 8
 minimize_inactive = false  # Minimize clients when cycling away (saves resources)
+close_to_tray = false      # Closing the panel keeps Nicotine running in the tray
+start_in_tray = false      # With close_to_tray: launch to the tray, no panel
 ```
 
 Per-character jump hotkeys live under `[character_hotkeys."Name"]` with `vk` and optional `modifier`; the config panel writes them for you.
