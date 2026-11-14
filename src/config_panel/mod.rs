@@ -242,6 +242,9 @@ pub(super) struct Panel {
     /// Mutter forbids a client positioning windows, so restack is a no-op
     /// (see `window_manager::restack_supported`). Always true on Windows.
     pub restack_supported: bool,
+    /// The panel window while it's open. The iced runtime runs as a
+    /// daemon, so it outlives the window; `None` means no window is open.
+    pub window: Option<iced::window::Id>,
 }
 
 impl Panel {
@@ -289,6 +292,7 @@ impl Panel {
             drag_hover: None,
             version_polls: 0,
             outputs_polls: 0,
+            window: None,
         }
     }
 
@@ -296,6 +300,16 @@ impl Panel {
     /// once the user goes idle.
     pub(super) fn touch(&mut self) {
         self.last_change = Some(Instant::now());
+    }
+
+    /// Write an edit still waiting on the autosave debounce, so it isn't
+    /// lost when the window closes or the app quits.
+    fn flush_pending_save(&mut self) {
+        if self.last_change.take().is_some() {
+            if let Err(e) = self.config.save() {
+                eprintln!("config save on close failed: {e}");
+            }
+        }
     }
 
     fn handle_capture_key(&mut self, event: iced::keyboard::Event) -> Task<Message> {
@@ -426,7 +440,7 @@ pub(super) enum Message {
     VersionPoll,
     OutputsPoll,
     WindowResized(u32, u32),
-    CloseRequested,
+    CloseRequested(iced::window::Id),
 }
 
 fn update(panel: &mut Panel, message: Message) -> Task<Message> {
@@ -712,23 +726,20 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
                 panel.touch();
             }
         }
-        Message::CloseRequested => {
+        Message::CloseRequested(_id) => {
             // The window is closing — flush a pending edit (e.g. a resize made
             // within the autosave debounce) before we exit, so it isn't lost.
-            // Paired with `exit_on_close_request(false)` so we control teardown;
-            // `exit()` then ends the runtime (and tears the window down).
-            if panel.last_change.take().is_some() {
-                if let Err(e) = panel.config.save() {
-                    eprintln!("config save on close failed: {e}");
-                }
-            }
+            // The window opens with `exit_on_close_request: false` so we
+            // control teardown; `exit()` then ends the runtime (and tears the
+            // window down).
+            panel.flush_pending_save();
             return iced::exit();
         }
     }
     Task::none()
 }
 
-fn view(panel: &Panel) -> Element<'_, Message> {
+fn view(panel: &Panel, _window: iced::window::Id) -> Element<'_, Message> {
     use iced::widget::{column, row, scrollable};
     use iced::Length;
 
@@ -752,7 +763,7 @@ fn view(panel: &Panel) -> Element<'_, Message> {
 /// iced palette for built-in widgets (checkboxes, sliders, inputs, pick
 /// lists, plain buttons); iced derives their hover/weak/strong shades from
 /// it, including dark-background variants.
-fn theme(_panel: &Panel) -> Theme {
+fn theme(_panel: &Panel, _window: iced::window::Id) -> Theme {
     let p = palette();
     Theme::custom(
         "Nicotine".to_string(),
@@ -806,8 +817,8 @@ fn subscription(panel: &Panel) -> Subscription<Message> {
         Message::WindowResized(size.width.round() as u32, size.height.round() as u32)
     }));
     // Save-on-close: flush a just-made resize the debounce hasn't written yet.
-    // Paired with `exit_on_close_request(false)` in `run`.
-    subs.push(iced::window::close_requests().map(|_| Message::CloseRequested));
+    // Paired with `exit_on_close_request: false` in `window_settings`.
+    subs.push(iced::window::close_requests().map(Message::CloseRequested));
     Subscription::batch(subs)
 }
 
@@ -1188,19 +1199,14 @@ pub(super) fn code_to_label(code: u16) -> String {
     }
 }
 
-/// Open the config panel as a native window. Blocks until the user closes
-/// it. Takes a shared LiveSettings so slider changes apply to the running
-/// preview manager instantly.
+/// Settings for the panel window, sized from the persisted panel size.
 ///
 /// NOTE: we deliberately do NOT force the winit X11 backend here. On
 /// Wayland sessions winit picks Wayland and wgpu renders natively; forcing
 /// X11 (XWayland) panics wgpu with "Invalid surface" on KWin.
-pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
+fn window_settings(config: &Config) -> iced::window::Settings {
     let icon =
         iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok();
-
-    let audio = crate::audio::spawn();
-    let _ = PALETTE.set(crate::theme::Theme::named(config.theme.as_deref()).panel);
 
     // `mut` is only used on Linux (the app_id assignment below); on other
     // platforms the binding is never mutated, so allow the unused-mut lint
@@ -1213,6 +1219,9 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
         min_size: Some(iced::Size::new(560.0, 420.0)),
         resizable: true,
         icon,
+        // We handle close ourselves (flush a pending resize first); see the
+        // CloseRequested message + close_requests subscription.
+        exit_on_close_request: false,
         ..Default::default()
     };
     // On Linux the titlebar/taskbar icon comes from a desktop-file match, not
@@ -1223,9 +1232,27 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     {
         window.platform_specific.application_id = "nicotine".to_string();
     }
+    window
+}
 
-    iced::application(
-        move || Panel::new(config.clone(), Arc::clone(&live), audio.clone()),
+/// Run the config panel. Blocks until the app quits. Takes a shared
+/// LiveSettings so slider changes apply to the running preview manager
+/// instantly.
+///
+/// The iced runtime runs as a daemon: it doesn't exit when its last window
+/// closes, and the panel window is opened explicitly at boot. Closing the
+/// window still quits (see `Message::CloseRequested`).
+pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
+    let audio = crate::audio::spawn();
+    let _ = PALETTE.set(crate::theme::Theme::named(config.theme.as_deref()).panel);
+
+    iced::daemon(
+        move || {
+            let mut panel = Panel::new(config.clone(), Arc::clone(&live), audio.clone());
+            let (id, open) = iced::window::open(window_settings(&panel.config));
+            panel.window = Some(id);
+            (panel, open.discard())
+        },
         update,
         view,
     )
@@ -1236,13 +1263,9 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> iced::Result {
     })
     .theme(theme)
     .subscription(subscription)
-    // We handle close ourselves (flush a pending resize before exit); see the
-    // CloseRequested message + close_requests subscription.
-    .exit_on_close_request(false)
     .default_font(iced::Font::with_name("JetBrains Mono"))
     .font(include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf").as_slice())
     .font(include_bytes!("../../assets/fonts/Marlboro.ttf").as_slice())
-    .window(window)
     .run()
 }
 
