@@ -14,11 +14,13 @@ mod cycle_state;
 mod daemon;
 mod ipc;
 mod lock;
+mod panel_bridge;
 mod paths;
 mod preview_common;
 mod preview_positions;
 mod telemetry;
 mod theme;
+mod tray;
 mod window_manager;
 
 mod version_check;

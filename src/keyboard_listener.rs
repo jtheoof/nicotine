@@ -314,12 +314,15 @@ impl KeyboardListener {
                         &pressed_modifiers,
                     ) {
                         if event.value() == 1 {
-                            let mut live = live.lock().unwrap();
-                            live.show_previews = !live.show_previews;
-                            println!(
-                                "Preview windows toggled {} via hotkey",
-                                if live.show_previews { "on" } else { "off" }
-                            );
+                            {
+                                let mut live = live.lock().unwrap();
+                                live.show_previews = !live.show_previews;
+                                println!(
+                                    "Preview windows toggled {} via hotkey",
+                                    if live.show_previews { "on" } else { "off" }
+                                );
+                            }
+                            crate::tray::refresh();
                         }
                         continue;
                     }
