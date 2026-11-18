@@ -2,39 +2,99 @@
 //!
 //! The OS audio handle (`MixerDeviceSink`) is `!Send`, so it lives entirely
 //! on this worker thread; the rest of the app only holds the channel `Sender`.
+//!
+//! The output device is opened only while the jingle plays and closed once
+//! it ends. Holding it open for the whole session would keep a live stream
+//! running against a device that can disappear (headset unplugged, sound
+//! server restarted). When that happens cpal reports an error on every poll,
+//! and Nicotine used to print each one, writing gigabytes of identical lines
+//! to its log.
 
 use std::io::Cursor;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// The jingle, embedded so it ships with the binary (like the fonts/icon).
 const JINGLE: &[u8] = include_bytes!("../assets/nicotinecountry.mp3");
 
+/// How often the worker checks, while playing, whether the jingle ended or
+/// the stream failed.
+const POLL: Duration = Duration::from_millis(250);
+
+/// An open output device playing the jingle.
+struct Playback {
+    // Field order matters: the player must drop before the device it
+    // plays through.
+    player: rodio::Player,
+    _sink: rodio::MixerDeviceSink,
+    failed: Arc<AtomicBool>,
+}
+
+impl Playback {
+    fn start() -> Result<Self, String> {
+        let failed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&failed);
+        let mut sink = rodio::DeviceSinkBuilder::from_default_device()
+            .map_err(|e| e.to_string())?
+            .with_error_callback(move |e| {
+                // cpal can report the same error on every poll once a
+                // device goes bad; log the first and let the worker close
+                // the stream.
+                if !flag.swap(true, Ordering::Relaxed) {
+                    eprintln!("audio: stream error ({e}); closing the output device");
+                }
+            })
+            .open_stream()
+            .map_err(|e| e.to_string())?;
+        // Closing the device after each play is intended, not worth a log line.
+        sink.log_on_drop(false);
+        let player = rodio::play(sink.mixer(), Cursor::new(JINGLE)).map_err(|e| e.to_string())?;
+        Ok(Self {
+            player,
+            _sink: sink,
+            failed,
+        })
+    }
+
+    fn done(&self) -> bool {
+        self.player.empty() || self.failed.load(Ordering::Relaxed)
+    }
+}
+
 /// Spawn the audio worker. Returns a sender — send `()` to play the jingle
 /// from the start, restarting it if it's already playing.
 ///
-/// Best-effort: if no output device opens (or decoding fails) the commands
-/// are dropped without affecting the rest of the app.
+/// Best-effort: if no output device opens (or decoding fails) the request
+/// is dropped without affecting the rest of the app, and the next one tries
+/// again.
 pub fn spawn() -> Sender<()> {
     let (tx, rx) = channel::<()>();
     std::thread::spawn(move || {
-        let handle = match rodio::DeviceSinkBuilder::open_default_sink() {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("audio: could not open output device ({e}); logo jingle disabled");
-                return;
-            }
-        };
-
-        // Holding the current Player keeps its sound alive; replacing it
-        // drops (and thus stops) the previous one — exactly the
-        // restart-on-re-click behavior we want.
-        let mut current: Option<rodio::Player> = None;
-        while rx.recv().is_ok() {
-            match rodio::play(handle.mixer(), Cursor::new(JINGLE)) {
-                Ok(player) => {
-                    current.replace(player);
+        let mut current: Option<Playback> = None;
+        loop {
+            let request = if current.is_some() {
+                rx.recv_timeout(POLL)
+            } else {
+                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
+            match request {
+                Ok(()) => {
+                    // Close the previous stream first, so a restart doesn't
+                    // briefly hold two devices open.
+                    current = None;
+                    match Playback::start() {
+                        Ok(playback) => current = Some(playback),
+                        Err(e) => eprintln!("audio: couldn't play the logo jingle ({e})"),
+                    }
                 }
-                Err(e) => eprintln!("audio: playback failed ({e})"),
+                Err(RecvTimeoutError::Timeout) => {
+                    if current.as_ref().is_some_and(Playback::done) {
+                        current = None;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     });
