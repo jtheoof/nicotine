@@ -36,18 +36,14 @@ impl Playback {
     fn start() -> Result<Self, String> {
         let failed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&failed);
-        let mut sink = rodio::DeviceSinkBuilder::from_default_device()
-            .map_err(|e| e.to_string())?
-            .with_error_callback(move |e| {
-                // cpal can report the same error on every poll once a
-                // device goes bad; log the first and let the worker close
-                // the stream.
-                if !flag.swap(true, Ordering::Relaxed) {
-                    eprintln!("audio: stream error ({e}); closing the output device");
-                }
-            })
-            .open_stream()
-            .map_err(|e| e.to_string())?;
+        let on_error = move |e: rodio::cpal::StreamError| {
+            // cpal can report the same error on every poll once a device
+            // goes bad; log the first and let the worker close the stream.
+            if !flag.swap(true, Ordering::Relaxed) {
+                eprintln!("audio: stream error ({e}); closing the output device");
+            }
+        };
+        let mut sink = open_sink(on_error)?;
         // Closing the device after each play is intended, not worth a log line.
         sink.log_on_drop(false);
         let player = rodio::play(sink.mixer(), Cursor::new(JINGLE)).map_err(|e| e.to_string())?;
@@ -61,6 +57,41 @@ impl Playback {
     fn done(&self) -> bool {
         self.player.empty() || self.failed.load(Ordering::Relaxed)
     }
+}
+
+/// Open the default output device, falling back to the first other device
+/// that works, like `rodio::DeviceSinkBuilder::open_default_sink` (which
+/// can't take a custom error callback). The fallback matters: on some
+/// systems the ALSA default is a dmix device that can't open while
+/// PipeWire holds the hardware, but the `pipewire` device can.
+fn open_sink<E>(on_error: E) -> Result<rodio::MixerDeviceSink, String>
+where
+    E: FnMut(rodio::cpal::StreamError) + Clone + Send + 'static,
+{
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    use rodio::DeviceSinkBuilder;
+
+    let first_err = match DeviceSinkBuilder::from_default_device()
+        .and_then(|b| b.with_error_callback(on_error.clone()).open_stream())
+    {
+        Ok(sink) => return Ok(sink),
+        Err(e) => e.to_string(),
+    };
+    rodio::cpal::default_host()
+        .output_devices()
+        .map_err(|_| first_err.clone())?
+        .filter(|dev| {
+            dev.description()
+                .is_ok_and(|d| d.driver().is_some_and(|driver| driver != "null"))
+        })
+        .find_map(|dev| {
+            DeviceSinkBuilder::from_device(dev)
+                .ok()?
+                .with_error_callback(on_error.clone())
+                .open_sink_or_fallback()
+                .ok()
+        })
+        .ok_or(first_err)
 }
 
 /// Spawn the audio worker. Returns a sender — send `()` to play the jingle
