@@ -133,6 +133,29 @@ enum CycleOp {
     Switch(usize),
 }
 
+/// Open a fresh log file for the daemonized process, keeping the previous
+/// run's as `<name>.old`. Falls back to /dev/null so a broken log directory
+/// never stops Nicotine from starting.
+#[cfg(unix)]
+fn open_log(dir: &std::path::Path, name: &str) -> std::fs::File {
+    let path = dir.join(name);
+    let open = || -> std::io::Result<std::fs::File> {
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::rename(&path, dir.join(format!("{name}.old")));
+        std::fs::File::create(&path)
+    };
+    open().unwrap_or_else(|e| {
+        eprintln!(
+            "Can't write {} ({e}); discarding its output",
+            path.display()
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+    })
+}
+
 #[cfg(unix)]
 fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     let live = LiveSettings::from_config(&config);
@@ -140,24 +163,11 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     // Daemonize so the launching terminal returns immediately while the
     // config panel + daemon thread keep running in the background — same
     // UX as `nicotine.exe` start on Windows where the GUI process detaches
-    // from any console. Pipe child stdout/stderr to a log file under
-    // /tmp so a panicking egui/winit init doesn't disappear into /dev/null.
-    let stdout = std::fs::File::create("/tmp/nicotine.out").unwrap_or_else(|_| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open("/dev/null")
-            .expect("/dev/null")
-    });
-    let stderr = std::fs::File::create("/tmp/nicotine.err").unwrap_or_else(|_| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open("/dev/null")
-            .expect("/dev/null")
-    });
+    // from any console. Pipe child stdout/stderr to log files so a
+    // panicking iced/winit init doesn't disappear into /dev/null.
+    let log_dir = paths::log_dir();
+    let stdout = open_log(&log_dir, "stdout.log");
+    let stderr = open_log(&log_dir, "stderr.log");
     let daemonize = Daemonize::new()
         .working_directory("/tmp")
         .umask(0o027)
