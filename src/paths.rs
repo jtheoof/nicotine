@@ -29,3 +29,16 @@ fn runtime_path(filename: &str) -> PathBuf {
 pub fn lock_file_path() -> PathBuf {
     runtime_path("nicotine-cycle.lock")
 }
+
+/// Where `nicotine start` writes the daemonized process's stdout/stderr:
+/// `$XDG_STATE_HOME/nicotine` (default `~/.local/state/nicotine`). Kept out
+/// of `/tmp`, which is often a size-limited tmpfs where a runaway log
+/// starves every other program writing temp files.
+#[cfg(unix)]
+pub fn log_dir() -> PathBuf {
+    let mut p = dirs::state_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    p.push("nicotine");
+    p
+}
